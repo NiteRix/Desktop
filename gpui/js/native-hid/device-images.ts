@@ -155,6 +155,7 @@ const DEVICE_IMAGE_BASE_URL = "https://img.openmouse.app/";
  */
 const LOCAL_OVERRIDES: Readonly<Record<string, string>> = {
   "attackshark-x11.png": "/devices/attackshark-x11.png",
+  "attackshark-x8-se.png": "/devices/attackshark-x8-se.png",
   "keychron-nape-pro.png": "/devices/keychron-nape-pro.png",
   "logitech-mx-master-4.png": "/devices/logitech-mx-master-4.png",
   "pulsar-pro-dongle.png": "/devices/pulsar-pro-dongle.png",
@@ -211,6 +212,7 @@ const ART_BOUNDS: Readonly<Record<string, ArtBounds>> = {
   "atk-f1-v2-ultra-max.png": { x: 0.2534, y: 0.0339, w: 0.4932, h: 0.9322, aspect: 1 },
   "attackshark-r5-ultra.png": { x: 0.034, y: 0.02, w: 0.934, h: 0.9567, aspect: 0.5222 },
   "attackshark-x11.png": { x: 0.2637, y: 0.0137, w: 0.5078, h: 0.9688, aspect: 1 },
+  "attackshark-x8-se.png": { x: 0.2559, y: 0.0391, w: 0.4824, h: 0.9375, aspect: 1 },
   "crdrako-ko-one.png": { x: 0.2915, y: 0.103, w: 0.417, h: 0.79, aspect: 1 },
   "endgame-gear-op1-8k.png": { x: 0.3242, y: 0, w: 0.335, h: 0.8475, aspect: 1 },
   "endgame-gear-op1we.png": { x: 0.3192, y: 0.1808, w: 0.345, h: 0.6758, aspect: 1 },
@@ -343,6 +345,9 @@ export function deviceImageFallback(event: Event): void {
  * fallback for shared receiver product ids, same as the webapp.
  */
 function resolveDeviceImageFilename(key: string | null | undefined, displayName: string): string {
+  // The X8 SE shares the 1d57:fa60 receiver with the X11, so the name the
+  // driver reads back from the receiver has to win over that id's entry.
+  if (/\battack\s*shark\s*x8\s*se\b/i.test(displayName)) return "attackshark-x8-se.png";
   const mapped = key ? DEVICE_IMAGES.get(key) ?? null : null;
   if (mapped) return mapped;
   // Lightspeed receivers are shared product IDs, so paired G502 X variants

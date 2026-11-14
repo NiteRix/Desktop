@@ -28,6 +28,16 @@ use serde_json::Value;
 
 const BUNDLE: &str = include_str!("../js/dist/bundle.js");
 
+/// Device art from public/devices that is not on the CDN yet, compiled into
+/// the binary so installed builds can show it (see `fetch_original`).
+const EMBEDDED_ART: &[(&str, &[u8])] = &[
+    ("attackshark-x11.png", include_bytes!("../../public/devices/attackshark-x11.png")),
+    ("attackshark-x8-se.png", include_bytes!("../../public/devices/attackshark-x8-se.png")),
+    ("keychron-nape-pro.png", include_bytes!("../../public/devices/keychron-nape-pro.png")),
+    ("logitech-mx-master-4.png", include_bytes!("../../public/devices/logitech-mx-master-4.png")),
+    ("pulsar-pro-dongle.png", include_bytes!("../../public/devices/pulsar-pro-dongle.png")),
+];
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Interface {
     pub key: String,
@@ -129,12 +139,23 @@ impl DeviceArt {
             return Some(target);
         }
         // Art not yet on the CDN is served from public/devices (the Tauri
-        // app's LOCAL_OVERRIDES); in this app that is a dev-tree path.
+        // app's LOCAL_OVERRIDES). A dev tree reads it from there; an
+        // installed build has no dev tree, so it uses the copy compiled in.
         if self.url.starts_with("/devices/") {
             let local = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../public")
                 .join(self.url.trim_start_matches('/'));
-            return local.is_file().then_some(local);
+            if local.is_file() {
+                return Some(local);
+            }
+            let name = self.url.trim_start_matches("/devices/");
+            let bytes = EMBEDDED_ART.iter().find(|(file, _)| *file == name)?.1;
+            let tmp = dir.join(format!("{}.part", self.filename));
+            if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, &target).is_ok() {
+                return Some(target);
+            }
+            let _ = std::fs::remove_file(&tmp);
+            return None;
         }
         let tmp = dir.join(format!("{}.part", self.filename));
         let ok = crate::proc::quiet(

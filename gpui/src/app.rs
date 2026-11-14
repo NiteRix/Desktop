@@ -211,8 +211,8 @@ struct ProfileOverride {
 const MIN_CARD_W: f32 = 320.0;
 const GRID_GAP: f32 = 16.0;
 const PAGE_PAD: f32 = 16.0;
-const SIDEBAR_W: f32 = 264.0;
-const SIDEBAR_COLLAPSED_W: f32 = 72.0;
+const SIDEBAR_W: f32 = 248.0;
+const SIDEBAR_COLLAPSED_W: f32 = 68.0;
 
 /// The community server, the same invite openmouse.app links to.
 const DISCORD_INVITE_URL: &str = "https://discord.gg/yxC9jzMdw6";
@@ -227,6 +227,23 @@ const UPDATES_LEADING_ROWS: usize = 3;
 
 /// The Discord glyph drawn in `color`, so it follows the theme like the other
 /// sidebar icons instead of being a fixed brand blue. One image per colour.
+/// The OpenMouse mark the web sidebar head shows (`.om-brand-mark`).
+fn brand_mark() -> std::sync::Arc<Image> {
+    static MARK: std::sync::OnceLock<std::sync::Arc<Image>> = std::sync::OnceLock::new();
+    MARK.get_or_init(|| std::sync::Arc::new(Image::from_bytes(ImageFormat::Png, include_bytes!("../assets/logo.png").to_vec())))
+        .clone()
+}
+
+/// The Add device block's render (the web block crossfades supported mice;
+/// this shows the X8 SE artwork, dimmed).
+fn add_device_art() -> std::sync::Arc<Image> {
+    static ART: std::sync::OnceLock<std::sync::Arc<Image>> = std::sync::OnceLock::new();
+    ART.get_or_init(|| {
+        std::sync::Arc::new(Image::from_bytes(ImageFormat::Png, include_bytes!("../../public/devices/attackshark-x8-se.png").to_vec()))
+    })
+    .clone()
+}
+
 fn themed_discord(color: Hsla) -> std::sync::Arc<Image> {
     static CACHE: std::sync::Mutex<Vec<(u32, std::sync::Arc<Image>)>> = std::sync::Mutex::new(Vec::new());
     let rgba: Rgba = color.into();
@@ -356,7 +373,9 @@ fn hex_color(hex: &str) -> Hsla {
 
 /// How often the monitor looks for plugged/unplugged devices and re-reads
 /// battery (Bridge reads batteries on an interval for the same reasons).
-const MONITOR_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+const MONITOR_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+/// Status (battery) is re-read every this many monitor ticks (30 s).
+const STATUS_EVERY_TICKS: u32 = 15;
 /// Battery level that turns the tray red and raises the low-battery alert
 /// (Bridge's default threshold).
 const LOW_BATTERY_PERCENT: u8 = 20;
@@ -367,6 +386,7 @@ const LOW_BATTERY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs
 struct Monitor {
     started: bool,
     busy: bool,
+    ticks: u32,
     /// Devices that appeared after launch: announced once their status reads.
     announce: std::collections::HashSet<String>,
     /// When each mouse last raised the low-battery alert.
@@ -933,6 +953,11 @@ impl AppView {
             return;
         }
         self.monitor.busy = true;
+        self.monitor.ticks = self.monitor.ticks.wrapping_add(1);
+        let reread = self.monitor.ticks % STATUS_EVERY_TICKS == 0;
+        // A receiver whose mouse is asleep or on its cable is asked more often,
+        // so switching the mouse on is noticed within a few seconds.
+        let receivers_due = self.monitor.ticks % 3 == 0;
         let service = self.hid_service();
         cx.spawn(async move |view, cx| {
             let Ok(Ok(candidates)) = service.list_candidates().await else {
@@ -969,7 +994,13 @@ impl AppView {
                     .devices
                     .tiles
                     .iter()
-                    .filter(|t| matches!(t.status, TileStatus::Connected(_) | TileStatus::Idle))
+                    .filter(|t| match t.status {
+                        TileStatus::Idle => true,
+                        TileStatus::Connected(_) => {
+                            reread || v.monitor.announce.contains(&t.key) || (receivers_due && t.name.contains("receiver"))
+                        }
+                        _ => false,
+                    })
                     .map(|t| t.key.clone())
                     .collect();
                 if removed || !added.is_empty() {
@@ -1004,18 +1035,25 @@ impl AppView {
                     }
                     return;
                 };
+                let mut woke = false;
                 if let Some(name) = device
                     .status
                     .get("name")
                     .and_then(|n| n.as_str())
                     .filter(|n| !n.is_empty() && *n != tile.name)
                 {
+                    // A receiver that only knew itself now names its mouse: the
+                    // mouse was switched on or came back from the cable.
+                    woke = tile.name.contains("receiver") && !name.contains("receiver");
                     tile.name = name.to_string();
                     new_name = Some(name.to_string());
                 }
                 tile.brand = device.brand.clone();
                 tile.display_brand = device.display_brand.clone().filter(|b| !b.is_empty()).unwrap_or_else(|| device.brand.clone());
                 tile.status = TileStatus::Connected(DeviceReadout::from_status(&device.status, device.controls.clone(), device.tabs.clone().unwrap_or_default()));
+                if woke {
+                    v.monitor.announce.insert(key.clone());
+                }
                 v.after_status(&key, cx);
                 cx.notify();
             });
@@ -2334,62 +2372,215 @@ impl AppView {
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::web_style::{alpha, icon_el, Lucide, Tokens, R_SM};
+        let t = Tokens::read(cx);
         let collapsed = self.sidebar_collapsed;
-        let fg = cx.theme().foreground;
-        let border = cx.theme().border;
-        let accent = cx.theme().primary;
 
-        let mut nav = div().flex().flex_col().gap_1();
-        for (id, page) in [("nav-overview", Page::Overview), ("nav-games", Page::Games), ("nav-supported", Page::Supported)] {
-            nav = nav.child(self.nav_row(id, page.icon(), page.label(), self.page == page, collapsed, cx).on_click(
-                cx.listener(move |this, _, _, cx| {
-                    // Choosing the page you are on goes back to its top level.
-                    match page {
-                        Page::Overview => this.devices.open = None,
-                        Page::Games => this.profile_editor = None,
-                        _ => {}
-                    }
-                    this.page = page;
-                    cx.notify();
-                }),
-            ));
+        // `.om-nav-item`: 36px rows, radius 6, 10px inline, 13/500.
+        let nav_item = |id: &'static str, glyph: Lucide, label: &str, active: bool| {
+            let icon_color = if active { t.accent } else { t.text3 };
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .gap(px(11.))
+                .w_full()
+                .h(px(36.))
+                .px(px(10.))
+                .rounded(px(R_SM))
+                .text_size(px(13.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(if active { t.text1 } else { t.text2 })
+                .when(active, |row| row.bg(t.surface(2)).border_1().border_color(t.lit()))
+                .when(!active, |row| row.border_1().border_color(alpha(t.lit(), 0.0)).hover(|row| row.bg(t.glint()).text_color(t.text1)))
+                .cursor_pointer()
+                .child(icon_el(glyph, icon_color, 17.))
+                .when(!collapsed, |row| row.child(div().truncate().child(label.to_string())))
+        };
+
+        let mut nav = div().flex().flex_col().gap(px(2.));
+        for (id, page, glyph, label) in [
+            ("nav-overview", Page::Overview, Lucide::LayoutGrid, "Devices"),
+            ("nav-games", Page::Games, Lucide::Gamepad2, "Games"),
+            ("nav-supported", Page::Supported, Lucide::BookOpen, "Supported mice"),
+        ] {
+            nav = nav.child(nav_item(id, glyph, label, self.page == page).on_click(cx.listener(move |this, _, _, cx| {
+                match page {
+                    Page::Overview => this.devices.open = None,
+                    Page::Games => this.profile_editor = None,
+                    _ => {}
+                }
+                this.page = page;
+                cx.notify();
+            })));
         }
 
-        let discord = img(themed_discord(cx.theme().muted_foreground)).w(px(22.)).h(px(17.)).into_any_element();
+        // "Your devices": thumbnail, name, battery or connection state.
+        let mut devices = div().flex().flex_col().gap(px(6.));
+        if !self.devices.tiles.is_empty() {
+            if !collapsed {
+                devices = devices.child(
+                    div().px(px(10.)).text_size(px(11.)).font_weight(FontWeight::SEMIBOLD).text_color(t.text3).child("Your devices"),
+                );
+            }
+            let mut list = div().flex().flex_col().gap(px(2.));
+            for (index, tile) in self.devices.tiles.iter().enumerate() {
+                let active = self.page == Page::Overview && self.devices.open.as_deref() == Some(tile.key.as_str());
+                let live = matches!(tile.status, TileStatus::Connected(_));
+                let sub: AnyElement = match &tile.status {
+                    TileStatus::Connected(r) => match r.battery {
+                        Some(b) => {
+                            let percent = b.clamp(0.0, 100.0).round() as u8;
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .child(crate::web_style::battery_glyph(&t, percent, r.charging))
+                                .child(format!("{percent}%"))
+                                .into_any_element()
+                        }
+                        None => div().child("Connected").into_any_element(),
+                    },
+                    TileStatus::Connecting => div().child("Connecting…").into_any_element(),
+                    _ => div().child("Not connected").into_any_element(),
+                };
+                let key = tile.key.clone();
+                let art = div()
+                    .relative()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .flex_none()
+                    .size(px(36.))
+                    .rounded(px(R_SM))
+                    .bg(t.surface(3))
+                    .child(self.device_art(tile, 30., 1.0))
+                    .when(live, |art| {
+                        art.child(
+                            div()
+                                .absolute()
+                                .right(px(-2.))
+                                .bottom(px(-2.))
+                                .size(px(9.))
+                                .rounded_full()
+                                .bg(t.ok)
+                                .border_2()
+                                .border_color(t.ink0),
+                        )
+                    });
+                list = list.child(
+                    div()
+                        .id(("side-device", index))
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .w_full()
+                        .min_h(px(46.))
+                        .pl(px(6.))
+                        .pr(px(8.))
+                        .py(px(5.))
+                        .rounded(px(R_SM))
+                        .cursor_pointer()
+                        .when(active, |row| row.bg(t.surface(2)).border_1().border_color(t.lit()))
+                        .when(!active, |row| row.border_1().border_color(alpha(t.lit(), 0.0)).hover(|row| row.bg(t.glint())))
+                        .child(art)
+                        .when(!collapsed, |row| {
+                            row.child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .min_w_0()
+                                    .gap(px(1.))
+                                    .child(div().truncate().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(t.text1).child(tile.name.clone()))
+                                    .child(div().text_size(px(11.)).text_color(t.text3).child(sub)),
+                            )
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.page = Page::Overview;
+                            this.open_device(&key, cx);
+                        })),
+                );
+            }
+            devices = devices.child(list);
+        }
+
+        // Footer: What's new, Help & feedback, Settings; then a status line.
+        let foot_item = |id: &'static str, glyph: AnyElement, label: &str, sub: Option<&str>, external: bool, active: bool| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .gap(px(11.))
+                .w_full()
+                .min_h(px(36.))
+                .py(px(4.))
+                .px(px(10.))
+                .rounded(px(R_SM))
+                .cursor_pointer()
+                .text_color(if active { t.text1 } else { t.text2 })
+                .when(active, |row| row.bg(t.surface(2)).border_1().border_color(t.lit()))
+                .when(!active, |row| row.border_1().border_color(alpha(t.lit(), 0.0)).hover(|row| row.bg(t.glint()).text_color(t.text1)))
+                .child(glyph)
+                .when(!collapsed, |row| {
+                    row.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().truncate().text_size(px(13.)).font_weight(FontWeight::MEDIUM).child(label.to_string()))
+                            .children(sub.map(|s| div().truncate().text_size(px(11.)).text_color(t.text3).child(s.to_string()))),
+                    )
+                    .when(external, |row| row.child(icon_el(Lucide::ArrowUpRight, t.text4, 12.)))
+                })
+        };
         let on_updates = self.page == Page::Updates;
         let on_settings = self.page == Page::Settings;
-        let tone = |active: bool| if active { accent } else { cx.theme().muted_foreground };
-        let updates_icon = Icon::new(Page::Updates.icon()).size(px(18.)).text_color(tone(on_updates)).into_any_element();
-        let gear = Icon::new(Page::Settings.icon()).size(px(18.)).text_color(tone(on_settings)).into_any_element();
+        let discord = img(themed_discord(t.text3)).w(px(17.)).h(px(13.)).flex_none().into_any_element();
+        let connected = self.devices.tiles.iter().filter(|t| matches!(t.status, TileStatus::Connected(_))).count();
+        let status_text = match connected {
+            0 => "No mouse connected".to_string(),
+            1 => "1 device connected".to_string(),
+            n => format!("{n} devices connected"),
+        };
         let footer = div()
             .flex()
             .flex_col()
-            .rounded_xl()
-            .border_1()
-            .border_color(Hsla { a: 0.8, ..border })
-            .bg(Hsla { a: 0.04, ..fg })
-            .overflow_hidden()
+            .gap(px(2.))
+            .mt_auto()
+            .pt(px(10.))
+            .border_t_1()
+            .border_color(t.line(1))
             .child(
-                self.footer_row("footer-updates", updates_icon, "Updates", Some(&format!("v{APP_VERSION} · Release notes")), on_updates, collapsed, cx)
+                foot_item("footer-updates", icon_el(Lucide::Megaphone, if on_updates { t.accent } else { t.text3 }, 17.).into_any_element(), "What's new", None, false, on_updates)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.page = Page::Updates;
                         cx.notify();
                     })),
             )
-            .child(div().h(px(1.)).w_full().bg(Hsla { a: 0.8, ..border }))
             .child(
-                self.footer_row("footer-discord", discord, "Help & Feedback", Some("Join the community server"), false, collapsed, cx)
+                foot_item("footer-discord", discord, "Help & feedback", Some("Join the community server"), true, false)
                     .on_click(cx.listener(|_, _, _, cx| cx.open_url(DISCORD_INVITE_URL))),
             )
-            .child(div().h(px(1.)).w_full().bg(Hsla { a: 0.8, ..border }))
             .child(
-                self.footer_row("footer-settings", gear, Page::Settings.label(), None, self.page == Page::Settings, collapsed, cx)
+                foot_item("footer-settings", icon_el(Lucide::Settings, if on_settings { t.accent } else { t.text3 }, 17.).into_any_element(), "Settings", None, false, on_settings)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.page = Page::Settings;
                         cx.notify();
                     })),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(9.))
+                    .h(px(30.))
+                    .px(px(12.))
+                    .text_size(px(11.))
+                    .text_color(if connected > 0 { t.text2 } else { t.text3 })
+                    .child(div().flex_none().size(px(6.)).rounded_full().bg(if connected > 0 { t.ok } else { t.text4 }))
+                    .when(!collapsed, |row| row.child(div().truncate().child(status_text))),
             );
-        let _ = accent;
 
         div()
             .flex()
@@ -2397,82 +2588,69 @@ impl AppView {
             .flex_none()
             .w(px(if collapsed { SIDEBAR_COLLAPSED_W } else { SIDEBAR_W }))
             .h_full()
-            .px_3()
-            .pt_3()
-            .pb_3()
-            .gap_6()
+            .px(px(10.))
+            .pt(px(4.))
+            .pb(px(12.))
+            .gap(px(18.))
             .child(nav)
-            .child(div().flex_1())
+            .child(devices)
             .child(footer)
     }
 
+    /// The sidebar head (`.om-sidebar-head`): mark, name and build, and the
+    /// collapse chevron. It sits in the title bar row so the window keeps its
+    /// caption buttons on the right, as the web shell has no title bar.
     fn render_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        // Badge fade mirrors the theme-transition feel: 380ms in `App.css`
-        // is the full-theme swap; a hover reveal reads better faster.
-        const BADGE_FADE: Duration = Duration::from_millis(160);
-        let hovered = self.badge_hovered;
+        use crate::web_style::{icon_el, Lucide, Tokens, R_SM};
+        let t = Tokens::read(cx);
         let collapsed = self.sidebar_collapsed;
-        // The sidebar toggle lives here, just after the window buttons.
-        let toggle = Button::new("toggle-sidebar")
-            .ghost()
-            .compact()
-            .icon(IconName::Menu)
-            .accessibility_label(if collapsed { "Expand sidebar" } else { "Collapse sidebar" })
-            .tooltip(if collapsed { "Expand sidebar" } else { "Collapse sidebar" })
+        let mark = img(brand_mark()).w(px(14.)).h(px(21.)).flex_none();
+        let toggle = div()
+            .id("toggle-sidebar")
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_none()
+            .size(px(28.))
+            .rounded(px(R_SM))
+            .cursor_pointer()
+            .hover(|b| b.bg(t.glint()))
+            .child(icon_el(if collapsed { Lucide::ChevronRight } else { Lucide::ChevronLeft }, t.text3, 16.))
             .on_click(cx.listener(|this, _, _, cx| {
                 this.sidebar_collapsed = !this.sidebar_collapsed;
                 cx.notify();
             }));
         let brand = h_flex()
-            .id("title-brand")
             .items_center()
-            .gap_2()
-            .px_1()
-            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                this.badge_hovered = *hovered;
-                cx.notify();
-            }))
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(cx.theme().foreground)
-                    .child("OpenMouse Desktop"),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .px_1p5()
-                    .py_0p5()
-                    .rounded_md()
-                    .bg(cx.theme().muted)
-                    .text_color(cx.theme().muted_foreground)
-                    .when(!hovered, |this| this.invisible())
-                    .with_animation(
-                        ElementId::NamedInteger("title-badge".into(), hovered as u64),
-                        Animation::new(BADGE_FADE)
-                            .with_easing(gpui_kit::base::animation::ease_out_cubic),
-                        move |this, delta| {
-                            // Fade + slight rise on enter, reversed on exit
-                            // via the keyed id retargeting the animation.
-                            let progress = if hovered { delta } else { 1.0 - delta };
-                            this.opacity(progress).top(px(-4.0 * (1.0 - progress)))
-                        },
-                    )
-                    .child(format!("v{APP_VERSION} · {}", release_stage(APP_VERSION))),
-            );
-        // The kit's bar is a Windows caption (drag) region, which turns clicks
-        // into window moves; occluding it makes the toggle a normal client hit.
-        // Collapsed, the sidebar strip is narrower than the name, so the text
-        // would straddle its edge; only the toggle stays over the strip.
-        h_flex().items_center().gap_1().child(
-            // Collapsed, the bar's 12px left inset is mirrored on the right so
-            // the button centres over the icon column below it.
-            div()
-                .occlude()
-                .when(collapsed, |slot| slot.w(px(SIDEBAR_COLLAPSED_W - 24.)).flex().justify_center())
-                .child(toggle),
-        ).when(!collapsed, |row| row.child(brand))
+            .gap(px(10.))
+            .flex_1()
+            .min_w_0()
+            .px(px(2.))
+            .child(mark)
+            .when(!collapsed, |row| {
+                row.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .min_w_0()
+                        .child(div().text_size(px(15.)).font_weight(FontWeight(650.)).text_color(t.text1).child("OpenMouse"))
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(11.))
+                                .text_color(t.text3)
+                                .child(format!("{} · v{APP_VERSION}", release_stage(APP_VERSION).to_uppercase())),
+                        ),
+                )
+            });
+        h_flex()
+            .items_center()
+            .gap(px(6.))
+            .w(px((if collapsed { SIDEBAR_COLLAPSED_W } else { SIDEBAR_W }) - 12.))
+            .pl(px(6.))
+            .child(brand)
+            .child(toggle)
     }
 
     fn render_page(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -2715,7 +2893,7 @@ impl AppView {
                 Self::control_slider_row(slider, c.options.get(index).map(|o| o.label.clone()).unwrap_or_default(), cx)
             }
             "choice" if c.options.len() <= 8 => {
-                let mut row = h_flex().gap_2().flex_wrap().justify_end();
+                let mut row = h_flex().gap_2().flex_wrap().when(c.options.len() <= 3, |row| row.justify_end());
                 for option in &c.options {
                     let value = option.value.clone();
                     let sent = value.clone();
@@ -2774,7 +2952,20 @@ impl AppView {
                 .child(c.current.as_str().map(str::to_string).unwrap_or_else(|| c.current.to_string()))
                 .into_any_element(),
         };
-        let row = h_flex().gap_4().items_center().justify_between().child(label_block).child(control);
+        // A row of many option chips takes the full width under its label: side
+        // by side, the chips' one-line width squeezed the label to nothing.
+        let stacked = c.kind == "choice" && c.options.len() > 3;
+        let row = if stacked {
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .w_full()
+                .child(label_block)
+                .child(div().w_full().flex().flex_row().flex_wrap().gap_2().child(control))
+        } else {
+            h_flex().gap_4().items_center().justify_between().child(label_block).child(control)
+        };
         match unfolded {
             Some(options) => div().flex().flex_col().gap_2().child(row).child(options).into_any_element(),
             None => row.into_any_element(),
@@ -3562,287 +3753,234 @@ impl AppView {
         {
             return self.render_device_page(tile, view_width, view_height, cx);
         }
-        let fg = cx.theme().foreground;
-        let muted = cx.theme().muted_foreground;
-        let border = cx.theme().border;
-        let devices = &self.devices;
-
-        let header = h_flex()
-            .justify_between()
-            .items_center()
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .text_xl()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(fg)
-                            .child("Overview"),
-                    )
-                    .child(div().text_sm().text_color(muted).child(match devices.tiles.len() {
-                        0 => "No mouse connected".to_string(),
-                        1 => "1 supported device found".to_string(),
-                        n => format!("{n} supported devices found"),
-                    })),
-            )
-            .child(
-                Button::new("rescan")
-                    .ghost()
-                    .compact()
-                    .icon(IconName::Redo)
-                    .label(if devices.scanning { "Scanning…" } else { "Rescan" })
-                    .on_click(cx.listener(|this, _, _, cx| this.scan_devices(cx))),
-            );
-
-        let body: AnyElement = if let Some(tile) = devices.tiles.get(devices.selected) {
-            let mut stats = div().flex().flex_row().flex_wrap().gap_2();
-            let stat = |label: &str, value: String| {
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_0p5()
-                    .min_w(px(110.))
-                    .p_3()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(border)
-                    .child(div().text_xs().text_color(muted).child(label.to_string()))
-                    .child(
-                        div()
-                            .text_base()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(fg)
-                            .child(value),
-                    )
-            };
-            let mut tags = h_flex().gap_1().child(Tag::secondary().small().child(tile.display_brand.clone()));
-            let mut details = div().flex().flex_col().gap_3().flex_1().min_w_0();
-            match &tile.status {
-                TileStatus::Connected(r) => {
-                    if let Some(c) = &r.connection {
-                        tags = tags.child(accent_badge(c.clone(), cx.theme().primary, cx.theme().foreground));
-                    }
-                    if let Some(b) = r.battery {
-                        let fill = (b / 100.0).clamp(0.0, 1.0) as f32;
-                        details = details.child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap_1()
-                                .child(
-                                    div().text_sm().text_color(muted).child(format!(
-                                        "Battery {b:.0}%{}",
-                                        if r.charging { " · charging" } else { "" }
-                                    )),
-                                )
-                                .child(
-                                    div()
-                                        .h(px(8.))
-                                        .w_full()
-                                        .max_w(px(320.))
-                                        .rounded_full()
-                                        .bg(Hsla { a: 0.25, ..cx.theme().muted_foreground })
-                                        .child(
-                                            div()
-                                                .h_full()
-                                                .w(relative(fill))
-                                                .rounded_full()
-                                                .bg(cx.theme().primary),
-                                        ),
-                                ),
-                        );
-                    }
-                    if let Some(d) = r.dpi {
-                        stats = stats.child(stat("DPI", format!("{d:.0}")));
-                    }
-                    // A fixed-rate pipeline (Starlight X) has no rate to show, only its name.
-                    if r.polling_read_only && r.polling_rates.is_empty() {
-                        stats = stats.child(stat("Polling rate", "Perfect Polling".to_string()));
-                    } else if let Some(hz) = r.polling_hz {
-                        stats = stats.child(stat("Polling rate", format!("{hz:.0} Hz")));
-                    }
-                    if !r.firmware.is_empty() {
-                        stats = stats.child(stat("Firmware", r.firmware.join(" · ")));
-                    }
-                    details = details.child(stats);
-                }
-                TileStatus::Connecting => {
-                    details = details.child(div().text_sm().text_color(muted).child("Connecting…"));
-                }
-                TileStatus::Failed(error) => {
-                    details = details
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(cx.theme().danger)
-                                .child(format!("Could not read this device: {error}")),
-                        )
-                        .child({
-                            let key = tile.key.clone();
-                            Button::new("retry")
-                                .compact()
-                                .label("Try again")
-                                .on_click(cx.listener(move |this, _, _, cx| this.connect_tile(&key, false, cx)))
-                        });
-                }
-                TileStatus::Idle => {
-                    details = details.child({
-                        let key = tile.key.clone();
-                        Button::new("connect")
-                            .compact()
-                            .label("Connect")
-                            .on_click(cx.listener(move |this, _, _, cx| this.connect_tile(&key, false, cx)))
-                    });
-                }
-            }
-            let hero = h_flex()
-                .gap_5()
-                .items_start()
-                .p_4()
-                .rounded_xl()
-                .border_1()
-                .border_color(border)
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_3()
-                        .flex_1()
-                        .min_w_0()
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .text_xl()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(fg)
-                                        .child(if tile.name.is_empty() {
-                                            "Unknown device".to_string()
-                                        } else {
-                                            tile.name.clone()
-                                        }),
-                                )
-                                .child(tags),
-                        )
-                        .child(details),
-                );
-
-            // Large grid, one card per device: name and status top-left,
-            // artwork centred below.
-            // Columns: as many as fit at a comfortably large card width, but
-            // never more than there are devices — two devices split the page in
-            // two, one takes it all. The page padding and sidebar are estimated;
-            // a small error only shifts where the column count flips.
-            let sidebar = if self.sidebar_collapsed { SIDEBAR_COLLAPSED_W } else { SIDEBAR_W };
-            let avail = (view_width - sidebar - 2.0 * PAGE_PAD).max(MIN_CARD_W);
-            let fit = (((avail + GRID_GAP) / (MIN_CARD_W + GRID_GAP)).floor() as usize).clamp(1, 6);
-            let cols = fit.min(devices.tiles.len()).max(1) as u16;
-            let card_w = (avail - GRID_GAP * (cols as f32 - 1.0)) / cols as f32;
-            // The art is as big as the card is wide, but must leave room for the
-            // title bar, header, name/status lines and padding on a short window.
-            let art_side = (card_w - 66.0).min(view_height - 276.0).max(120.0);
-            let mut grid = div().grid().grid_cols(cols).gap_4().w_full();
-            for (i, t) in devices.tiles.iter().enumerate() {
-                let key = t.key.clone();
-                let active = i == devices.selected;
-                let (status_line, status_color) = match &t.status {
-                    TileStatus::Idle => ("Click to connect".to_string(), muted),
-                    TileStatus::Connecting => ("Connecting…".to_string(), muted),
-                    // A wireless mouse that is off or asleep answers nothing; say what to do.
-                    TileStatus::Failed(error) if error.to_lowercase().contains("asleep") || error.to_lowercase().contains("out of range") => {
-                        ("Asleep or out of range — wake it, then click to retry".to_string(), cx.theme().danger)
-                    }
-                    TileStatus::Failed(_) => ("Couldn't connect — click to retry".to_string(), cx.theme().danger),
-                    TileStatus::Connected(r) => {
-                        let mut parts = Vec::new();
-                        if let Some(b) = r.battery {
-                            parts.push(format!("{b:.0}%{}", if r.charging { " ⚡" } else { "" }));
-                        }
-                        if let Some(c) = &r.connection {
-                            parts.push(c.clone());
-                        }
-                        if parts.is_empty() {
-                            parts.push("Connected".to_string());
-                        }
-                        (parts.join("  ·  "), muted)
-                    }
-                };
-                grid = grid.child(
-                    div()
-                        .id(SharedString::from(format!("tile-{}", t.key)))
-                        .cursor_pointer()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .p_5()
-                        .rounded_lg()
-                        .border_1()
-                        .border_color(if active { cx.theme().primary } else { Hsla { a: 0.0, ..border } })
-                        // A faint lift off the page, derived from the text colour so
-                        // it is a surface in every theme (`muted` is a text tone
-                        // in the Matt palettes).
-                        .bg(Hsla { a: 0.06, ..fg })
-                        .hover(|this| this.bg(Hsla { a: 0.10, ..fg }))
-                        .child(
-                            div()
-                                .text_xl()
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(fg)
-                                .truncate()
-                                .child(if t.name.is_empty() {
-                                    "Unknown device".to_string()
-                                } else {
-                                    t.name.clone()
-                                }),
-                        )
-                        .child(div().text_sm().text_color(status_color).child(status_line))
-                        .child(div().w_full().p_3().flex().justify_center().child(self.device_art(t, art_side, 1.3)))
-                        .on_click(cx.listener(move |this, _, _, cx| this.open_device(&key, cx))),
-                );
-            }
-            let col = div()
-                .flex()
-                .flex_col()
-                .gap_4()
-                .child(grid)
-                .when(SHOW_DEVICE_DETAILS, |col| col.child(hero));
-            col.into_any_element()
-        } else {
-            let message = match (&devices.error, devices.scanning) {
-                (Some(error), _) => format!("Could not scan for devices: {error}"),
-                (None, true) => "Looking for mice…".to_string(),
-                (None, false) => "No supported mouse found. Plug one in and press Rescan.".to_string(),
-            };
-            div()
-                .p_6()
-                .rounded_xl()
-                .border_1()
-                .border_color(border)
-                .text_sm()
-                .text_color(muted)
-                .child(message)
-                .into_any_element()
-        };
-
-        div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .p_4()
-            .gap_4()
-            .overflow_y_scrollbar()
-            .child(header)
-            .child(body)
-            .into_any_element()
+        self.render_devices_home(view_width, view_height, cx)
     }
 
     /// The device the profile screen is editing: the one picked, else the first
     /// connected, else the first listed.
+    /// The web Devices page (`features/devices/DevicesHome.tsx`, `home.css`):
+    /// title and line, then the shelf of device blocks ending in Add device.
+    fn render_devices_home(&self, view_width: f32, view_height: f32, cx: &mut Context<Self>) -> AnyElement {
+        use crate::web_style::{alpha, icon_el, Lucide, Tokens, R_LG, R_SM};
+        let t = Tokens::read(cx);
+        let _ = view_width;
+        let block_h = (view_height * 0.58).clamp(440.0, 560.0);
+        let block_w = 330.0;
+
+        // `.om-btn` / `.om-btn.is-primary` at the block's full width.
+        let button = |id: SharedString, label: String, primary: bool, enabled: bool| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap(px(8.))
+                .w_full()
+                .h(px(38.))
+                .rounded(px(R_SM))
+                .text_size(px(13.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .when(primary, |b| b.bg(t.accent).text_color(t.on_accent))
+                .when(!primary, |b| b.bg(t.surface(2)).border_1().border_color(t.lit()).text_color(t.text1).hover(|b| b.bg(t.surface(3))))
+                .when(enabled, |b| b.cursor_pointer())
+                .when(!enabled, |b| b.opacity(0.45))
+                .child(label)
+        };
+
+        let mut shelf = h_flex().flex_wrap().justify_center().items_start().gap(px(16.));
+        for tile in &self.devices.tiles {
+            let live = matches!(tile.status, TileStatus::Connected(_));
+            let key = tile.key.clone();
+            let brand = if tile.display_brand.is_empty() { tile.brand.clone() } else { tile.display_brand.clone() };
+            let meta = if brand.is_empty() { "Mouse".to_string() } else { format!("{brand} · Mouse") };
+
+            let mut top = h_flex()
+                .items_center()
+                .gap(px(8.))
+                .min_h(px(28.))
+                .child(div().flex_1().min_w_0().truncate().text_size(px(16.)).font_weight(FontWeight(650.)).text_color(t.text1).child(tile.name.clone()));
+            if live {
+                top = top.child(
+                    h_flex()
+                        .flex_none()
+                        .items_center()
+                        .gap(px(6.))
+                        .px(px(8.))
+                        .py(px(2.))
+                        .rounded(px(R_SM))
+                        .bg(alpha(t.ok, 0.14))
+                        .text_size(px(12.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(t.ok)
+                        .child(div().size(px(6.)).rounded_full().bg(t.ok))
+                        .child("Connected"),
+                );
+            }
+
+            let mut stats = h_flex().items_center().gap(px(14.)).min_h(px(20.)).text_size(px(13.)).text_color(t.text2);
+            match &tile.status {
+                TileStatus::Connected(r) => {
+                    let wired = r.connection.as_deref() == Some("Wired");
+                    if let Some(connection) = &r.connection {
+                        stats = stats.child(
+                            h_flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .child(icon_el(if wired { Lucide::Plug } else { Lucide::Wifi }, t.text3, 15.))
+                                .child(connection.clone()),
+                        );
+                    }
+                    if let Some(b) = r.battery {
+                        let percent = b.clamp(0.0, 100.0).round() as u8;
+                        stats = stats.child(
+                            h_flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .child(crate::web_style::battery_glyph(&t, percent, r.charging))
+                                .child(format!("{percent}%")),
+                        );
+                    }
+                }
+                TileStatus::Failed(error) => {
+                    stats = stats.child(div().text_size(px(12.)).text_color(t.text3).truncate().child(error.lines().next().unwrap_or_default().to_string()));
+                }
+                _ => {}
+            }
+
+            // `.om-device-block-art`: the stage light, the render and its floor shadow.
+            let mut art = div().relative().flex_1().min_h(px(210.)).mx(px(-4.)).flex().items_center().justify_center();
+            if live {
+                art = art.child(
+                    div()
+                        .absolute()
+                        .size(px(170.))
+                        .rounded_full()
+                        .bg(alpha(t.accent, 0.07))
+                        .shadow(vec![BoxShadow {
+                            color: alpha(t.accent, 0.13),
+                            offset: point(px(0.), px(0.)),
+                            blur_radius: px(70.),
+                            spread_radius: px(24.),
+                        }]),
+                );
+            }
+            art = art
+                .child(
+                    div()
+                        .absolute()
+                        .bottom(relative(0.08))
+                        .w(relative(0.56))
+                        .h(px(14.))
+                        .rounded_full()
+                        .shadow(vec![BoxShadow {
+                            color: hsla(0., 0., 0., 0.5),
+                            offset: point(px(0.), px(0.)),
+                            blur_radius: px(10.),
+                            spread_radius: px(0.),
+                        }]),
+                )
+                .child(self.device_art(tile, 250., 1.0));
+
+            let action = match &tile.status {
+                TileStatus::Connected(_) => button(SharedString::from(format!("configure-{}", tile.key)), "Configure".into(), true, true),
+                TileStatus::Connecting => button(SharedString::from(format!("configure-{}", tile.key)), "Connecting…".into(), false, false),
+                TileStatus::Failed(_) => button(SharedString::from(format!("configure-{}", tile.key)), "Try again".into(), false, true),
+                TileStatus::Idle => button(SharedString::from(format!("configure-{}", tile.key)), "Connect".into(), false, true),
+            };
+            let open_key = key.clone();
+            let action = action.on_click(cx.listener(move |this, _, _, cx| this.open_device(&open_key, cx)));
+
+            let block = div()
+                .id(SharedString::from(format!("block-{}", tile.key)))
+                .relative()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .w(px(block_w))
+                .min_h(px(block_h))
+                .pt(px(16.))
+                .px(px(16.))
+                .pb(px(14.))
+                .rounded(px(R_LG))
+                .bg(t.surface(1))
+                .border_1()
+                .border_color(if live { alpha(t.accent, 0.24) } else { t.lit() })
+                .when(!live, |b| b.hover(|b| b.bg(t.surface(2))))
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| this.open_device(&key, cx)))
+                .child(top)
+                .child(div().text_size(px(12.)).text_color(t.text3).child(meta))
+                .child(stats)
+                .child(art)
+                .child(action);
+            shelf = shelf.child(block);
+        }
+
+        // The Add device block: plug-in hint and a rescan.
+        let add = div()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .w(px(block_w))
+            .min_h(px(block_h))
+            .pt(px(16.))
+            .px(px(16.))
+            .pb(px(14.))
+            .rounded(px(R_LG))
+            .bg(t.surface(1))
+            .border_1()
+            .border_color(t.line(1))
+            .child(h_flex().min_h(px(28.)).items_center().child(div().text_size(px(16.)).font_weight(FontWeight(650.)).text_color(t.text1).child("Add device")))
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .line_height(px(18.))
+                    .text_color(t.text3)
+                    .child("Plug in your mouse or its receiver. OpenMouse finds it on its own; rescan if it does not show up."),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(210.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(img(add_device_art()).w(px(190.)).h(px(190.)).object_fit(ObjectFit::Contain).opacity(0.5)),
+            )
+            .child(
+                button("rescan".into(), if self.devices.scanning { "Scanning…".into() } else { "Add device".into() }, false, !self.devices.scanning)
+                    .child(icon_el(Lucide::Plus, t.text1, 15.))
+                    .on_click(cx.listener(|this, _, _, cx| this.scan_devices(cx))),
+            );
+        shelf = shelf.child(add);
+
+        div()
+            .id("devices-home")
+            .size_full()
+            .overflow_y_scrollbar()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(22.))
+                    .min_h(relative(1.))
+                    .pt(px(28.))
+                    .px(px(32.))
+                    .pb(px(48.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.))
+                            .child(div().text_size(px(22.)).font_weight(FontWeight::SEMIBOLD).text_color(t.text1).child("Devices"))
+                            .child(div().text_size(px(13.)).text_color(t.text2).child("Devices this app can open. Pick one to change its settings.")),
+                    )
+                    .children(self.devices.error.clone().map(|e| div().text_size(px(12.)).text_color(t.bad).child(e)))
+                    .child(div().flex_1().flex().items_center().justify_center().child(shelf)),
+            )
+            .into_any_element()
+    }
+
     fn profile_target(&self) -> Option<usize> {
         let tiles = &self.devices.tiles;
         self.profile_device
@@ -4889,8 +5027,8 @@ impl Render for AppView {
             .h_full()
             .w(px(if self.sidebar_collapsed { SIDEBAR_COLLAPSED_W } else { SIDEBAR_W }))
             .border_r_1()
-            .border_color(Hsla { a: 0.7, ..cx.theme().border })
-            .bg(Hsla { a: 0.35, ..cx.theme().sidebar });
+            .border_color(crate::web_style::Tokens::read(cx).line(1))
+            .bg(Hsla { a: 0.92, ..cx.theme().sidebar });
         div().relative().size_full().children(toast).child(ascii).child(sidebar_backdrop).child(
             div()
                 .flex()

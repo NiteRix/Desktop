@@ -46,10 +46,10 @@ const DEVICE_IMAGES: ReadonlyMap<string, string> = new Map([
   // Attack Shark R5 Ultra wired and wireless transports share the same shell.
   ["373e:0046", "attackshark-r5-ultra.png"],
   ["373e:0047", "attackshark-r5-ultra.png"],
-  // Attack Shark X11: wired (0xfa55) and the 2.4 GHz receiver (0xfa60) share
-  // the same shell. 0xfa61 is the R1, a different mouse.
+  // Attack Shark X11 wired (0xfa55). The 2.4 GHz receiver (0xfa60) is shared by
+  // the X11, X8 SE, R1 and more, so it resolves by the name its mouse reports
+  // and shows the placeholder until one does. 0xfa61 is the R1.
   ["1d57:fa55", "attackshark-x11.png"],
-  ["1d57:fa60", "attackshark-x11.png"],
   // OP1 8K, Purple Frost, and v2. XM2 models use different shells.
   ["3367:1964", "endgame-gear-op1-8k.png"],
   ["3367:1976", "endgame-gear-op1-8k.png"],

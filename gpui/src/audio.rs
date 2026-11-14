@@ -117,6 +117,67 @@ pub fn play(chime: Chime) -> bool {
     return other::play(chime, bytes);
 }
 
+/// OpenMouse Bridge's notification chime (`src/overlay/chime.rs`, MIT): two
+/// soft bell tones, A5 then E6, the sound Bridge plays with its banner when a
+/// mouse connects or its battery runs low.
+mod bridge_chime {
+    const SAMPLE_RATE: u32 = 44_100;
+    const LENGTH_SECONDS: f32 = 0.7;
+    const PEAK: f32 = 0.45;
+    const NOTES: [(f32, f32); 2] = [(0.0, 880.0), (0.11, 1318.51)];
+    const ATTACK_SECONDS: f32 = 0.004;
+    const DECAY_SECONDS: f32 = 0.16;
+
+    pub fn wav(volume: u8) -> Vec<u8> {
+        let gain = (f32::from(volume.min(100)) / 100.0).powi(2) * PEAK;
+        let count = (SAMPLE_RATE as f32 * LENGTH_SECONDS) as u32;
+        let samples = (0..count).map(|index| {
+            let time = index as f32 / SAMPLE_RATE as f32;
+            let value: f32 = NOTES.iter().map(|&(start, frequency)| tone(time - start, frequency)).sum();
+            (value * gain * f32::from(i16::MAX)) as i16
+        });
+        let data_len = count * 2;
+        let mut wav = Vec::with_capacity(44 + data_len as usize);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+        wav.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        for sample in samples {
+            wav.extend_from_slice(&sample.to_le_bytes());
+        }
+        wav
+    }
+
+    fn tone(time: f32, frequency: f32) -> f32 {
+        if time < 0.0 {
+            return 0.0;
+        }
+        let envelope = (time / ATTACK_SECONDS).min(1.0) * (-time / DECAY_SECONDS).exp();
+        let phase = std::f32::consts::TAU * frequency * time;
+        envelope * (phase.sin() + 0.25 * (phase * 2.0).sin()) / 1.25
+    }
+}
+
+/// Plays Bridge's notification chime at Bridge's default volume (60).
+pub fn play_notification() -> bool {
+    static BYTES: OnceLock<Vec<u8>> = OnceLock::new();
+    let bytes: &'static [u8] = BYTES.get_or_init(|| bridge_chime::wav(60)).as_slice();
+    #[cfg(target_os = "macos")]
+    return macos::play(bytes);
+    #[cfg(windows)]
+    return windows::play(bytes);
+    #[cfg(not(any(target_os = "macos", windows)))]
+    return other::play(Chime::Success, bytes);
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
     use cocoa::base::{id, nil};

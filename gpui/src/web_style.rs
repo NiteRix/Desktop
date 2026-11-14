@@ -100,6 +100,13 @@ pub enum Lucide {
     Plus,
     ArrowUpRight,
     MousePointer,
+    Crosshair,
+    Activity,
+    Gauge,
+    ChartColumn,
+    Sliders,
+    Check,
+    ChevronDown,
 }
 
 impl Lucide {
@@ -117,6 +124,13 @@ impl Lucide {
             Lucide::Plus => 9,
             Lucide::ArrowUpRight => 10,
             Lucide::MousePointer => 11,
+            Lucide::Crosshair => 12,
+            Lucide::Activity => 13,
+            Lucide::Gauge => 14,
+            Lucide::ChartColumn => 15,
+            Lucide::Sliders => 16,
+            Lucide::Check => 17,
+            Lucide::ChevronDown => 18,
         }
     }
 
@@ -134,6 +148,13 @@ impl Lucide {
             Lucide::Plus => r#"<path d="M5 12h14"/><path d="M12 5v14"/>"#,
             Lucide::ArrowUpRight => r#"<path d="M7 7h10v10"/><path d="M7 17 17 7"/>"#,
             Lucide::MousePointer => r#"<rect x="5" y="2" width="14" height="20" rx="7"/><path d="M12 6v4"/>"#,
+            Lucide::Crosshair => r#"<circle cx="12" cy="12" r="10"/><line x1="22" x2="18" y1="12" y2="12"/><line x1="6" x2="2" y1="12" y2="12"/><line x1="12" x2="12" y1="6" y2="2"/><line x1="12" x2="12" y1="22" y2="18"/>"#,
+            Lucide::Activity => r#"<path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/>"#,
+            Lucide::Gauge => r#"<path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/>"#,
+            Lucide::ChartColumn => r#"<path d="M3 3v16a2 2 0 0 0 2 2h16"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/>"#,
+            Lucide::Sliders => r#"<line x1="21" x2="14" y1="4" y2="4"/><line x1="10" x2="3" y1="4" y2="4"/><line x1="21" x2="12" y1="12" y2="12"/><line x1="8" x2="3" y1="12" y2="12"/><line x1="21" x2="16" y1="20" y2="20"/><line x1="12" x2="3" y1="20" y2="20"/><line x1="14" x2="14" y1="2" y2="6"/><line x1="8" x2="8" y1="10" y2="14"/><line x1="16" x2="16" y1="18" y2="22"/>"#,
+            Lucide::Check => r#"<path d="M20 6 9 17l-5-5"/>"#,
+            Lucide::ChevronDown => r#"<path d="m6 9 6 6 6-6"/>"#,
         }
     }
 }
@@ -187,4 +208,68 @@ pub fn battery_glyph(t: &Tokens, percent: u8, charging: bool) -> Div {
                 .child(div().h_full().w(px(inner.max(1.0))).rounded(px(1.)).bg(fill)),
         )
         .child(div().w(px(1.5)).h(px(4.)).rounded_r(px(1.)).bg(t.text3))
+}
+
+/// `1,600`: the web's grouped, tabular figures.
+pub fn group(value: f64) -> String {
+    let n = value.round() as i64;
+    let digits = n.abs().to_string();
+    let mut out = String::new();
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    if n < 0 {
+        format!("-{out}")
+    } else {
+        out
+    }
+}
+
+/// A web panel (`.om-panel`): surface over the ground, lit edge, radius 10, 16 padding.
+pub fn panel(t: &Tokens) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(14.))
+        .p(px(16.))
+        .rounded(px(R_MD))
+        .bg(t.surface(1))
+        .border_1()
+        .border_color(t.lit())
+}
+
+/// A panel heading with the accent icon tile some cards carry.
+pub fn panel_head(t: &Tokens, glyph: Option<Lucide>, title: &str, sub: Option<&str>) -> Div {
+    let mut row = div().flex().flex_row().items_center().gap(px(10.));
+    if let Some(glyph) = glyph {
+        row = row.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .flex_none()
+                .size(px(34.))
+                .rounded(px(8.))
+                .bg(alpha(t.accent, 0.14))
+                .border_1()
+                .border_color(alpha(t.accent, 0.3))
+                .child(icon_el(glyph, t.accent, 17.)),
+        );
+    }
+    row.child(div().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).text_color(t.text1).child(title.to_string()))
+        .children(sub.map(|s| div().text_size(px(12.)).text_color(t.text3).child(s.to_string())))
+}
+
+/// A big tabular figure with its unit after it (`30/600`, unit at 12).
+pub fn figure(t: &Tokens, value: String, unit: &str, size: f32) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_end()
+        .gap(px(5.))
+        .child(div().text_size(px(size)).line_height(px(size * 1.1)).font_weight(FontWeight::SEMIBOLD).text_color(t.text1).child(value))
+        .child(div().pb(px(size * 0.12)).text_size(px(13.)).text_color(t.text3).child(unit.to_string()))
 }

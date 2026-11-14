@@ -236,12 +236,19 @@ fn brand_mark() -> std::sync::Arc<Image> {
 
 /// The Add device block's render (the web block crossfades supported mice;
 /// this shows the X8 SE artwork, dimmed).
-fn add_device_art() -> std::sync::Arc<Image> {
-    static ART: std::sync::OnceLock<std::sync::Arc<Image>> = std::sync::OnceLock::new();
-    ART.get_or_init(|| {
-        std::sync::Arc::new(Image::from_bytes(ImageFormat::Png, include_bytes!("../../public/devices/attackshark-x8-se.png").to_vec()))
-    })
-    .clone()
+fn add_device_art(index: usize) -> std::sync::Arc<Image> {
+    static ART: std::sync::OnceLock<Vec<std::sync::Arc<Image>>> = std::sync::OnceLock::new();
+    let art = ART.get_or_init(|| {
+        [
+            include_bytes!("../../public/devices/attackshark-x8-se-official.png").as_slice(),
+            include_bytes!("../../public/devices/attackshark-r1-official.png").as_slice(),
+            include_bytes!("../../public/devices/attackshark-x11.png").as_slice(),
+        ]
+        .iter()
+        .map(|bytes| std::sync::Arc::new(Image::from_bytes(ImageFormat::Png, bytes.to_vec())))
+        .collect()
+    });
+    art[index % art.len()].clone()
 }
 
 fn themed_discord(color: Hsla) -> std::sync::Arc<Image> {
@@ -318,6 +325,7 @@ impl Staged {
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 enum DeviceTab {
     #[default]
+    Overview,
     Performance,
     Buttons,
     Lighting,
@@ -329,6 +337,7 @@ enum DeviceTab {
 impl DeviceTab {
     fn label(self) -> &'static str {
         match self {
+            DeviceTab::Overview => "Overview",
             DeviceTab::Performance => "Performance",
             DeviceTab::Buttons => "Buttons",
             DeviceTab::Lighting => "Lighting",
@@ -391,6 +400,10 @@ struct Monitor {
     announce: std::collections::HashSet<String>,
     /// When each mouse last raised the low-battery alert.
     low_alerted: std::collections::HashMap<String, std::time::Instant>,
+    /// The device block under the pointer (its render lifts, as on the web).
+    hovered: Option<String>,
+    /// Battery readings this session, per device, for the Overview chart.
+    battery_log: std::collections::HashMap<String, Vec<(std::time::SystemTime, u8)>>,
 }
 
 struct Tile {
@@ -438,6 +451,9 @@ struct DeviceReadout {
     surface: Option<String>,
     battery: Option<f64>,
     charging: bool,
+    /// The on-device DPI stages (`dpiStages[].dpi`) and the active one.
+    stages: Vec<f64>,
+    active_stage: Option<usize>,
     dpi: Option<f64>,
     polling_hz: Option<f64>,
     connection: Option<String>,
@@ -478,6 +494,12 @@ impl DeviceReadout {
             lod_options: strings("supportedLiftOffDistances"),
             surface: s.get("gamingSurfaceMode").and_then(|v| v.as_str()).map(str::to_string),
             battery: num("batteryPercent"),
+            stages: s
+                .get("dpiStages")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.get("dpi").and_then(|d| d.as_f64()).or_else(|| x.as_f64())).collect())
+                .unwrap_or_default(),
+            active_stage: s.get("activeDpiStage").and_then(|v| v.as_u64()).map(|n| n as usize),
             charging: s
                 .get("batteryState")
                 .and_then(|v| v.as_str())
@@ -954,6 +976,10 @@ impl AppView {
         }
         self.monitor.busy = true;
         self.monitor.ticks = self.monitor.ticks.wrapping_add(1);
+        // The Add device block's showcase moves on every other tick.
+        if self.page == Page::Overview && self.devices.open.is_none() && self.monitor.ticks % 2 == 0 {
+            cx.notify();
+        }
         let reread = self.monitor.ticks % STATUS_EVERY_TICKS == 0;
         // A receiver whose mouse is asleep or on its cable is asked more often,
         // so switching the mouse on is noticed within a few seconds.
@@ -1073,7 +1099,23 @@ impl AppView {
         let battery = readout.battery.map(|b| b.clamp(0.0, 100.0).round() as u8);
         let charging = readout.charging;
         if self.monitor.announce.remove(key) {
-            self.announce(format!("{name} connected"), false, true, cx);
+            let detail = match battery {
+                Some(percent) if charging => format!("Connected · {percent}% · Charging"),
+                Some(percent) => format!("Connected · {percent}% battery"),
+                None => "Connected".to_string(),
+            };
+            self.notify_banner(name.clone(), detail, cx);
+        }
+        if let Some(percent) = battery {
+            let log = self.monitor.battery_log.entry(key.to_string()).or_default();
+            let now = std::time::SystemTime::now();
+            let changed = log.last().is_none_or(|(at, p)| *p != percent || now.duration_since(*at).is_ok_and(|d| d.as_secs() >= 300));
+            if changed {
+                log.push((now, percent));
+                if log.len() > 288 {
+                    log.remove(0);
+                }
+            }
         }
         if let Some(percent) = battery {
             let due = self
@@ -1083,10 +1125,21 @@ impl AppView {
                 .is_none_or(|at| at.elapsed() >= LOW_BATTERY_COOLDOWN);
             if !charging && percent <= LOW_BATTERY_PERCENT && due {
                 self.monitor.low_alerted.insert(key.to_string(), std::time::Instant::now());
-                self.announce(format!("{name} battery is low · {percent}%"), true, true, cx);
+                self.notify_banner("Mouse battery is low".into(), format!("{name} has {percent}% battery remaining"), cx);
             }
         }
         self.update_tray();
+    }
+
+    /// Bridge's banner and chime: a mouse connecting or running low.
+    fn notify_banner(&mut self, title: String, detail: String, cx: &mut Context<Self>) {
+        if self.settings.overlay_enabled {
+            let corner = self.settings.overlay_corner;
+            self.overlay = crate::overlay::show_banner(cx, self.overlay.take(), title, Some(detail), corner);
+        }
+        if self.settings.overlay_sound {
+            crate::audio::play_notification();
+        }
     }
 
     /// The tray shows the open device's battery, else the first connected
@@ -1119,7 +1172,7 @@ impl AppView {
         self.devices.selected = index;
         self.devices.staged = Staged::default();
         self.devices.unlinked_axes = false;
-        self.devices.tab = DeviceTab::Performance;
+        self.devices.tab = DeviceTab::Overview;
         self.devices.expanded = None;
         self.devices.onboard = None;
         self.devices.write_error = None;
@@ -2424,7 +2477,7 @@ impl AppView {
                 );
             }
             let mut list = div().flex().flex_col().gap(px(2.));
-            for (index, tile) in self.devices.tiles.iter().enumerate() {
+            for (index, tile) in self.visible_tiles().into_iter().enumerate() {
                 let active = self.page == Page::Overview && self.devices.open.as_deref() == Some(tile.key.as_str());
                 let live = matches!(tile.status, TileStatus::Connected(_));
                 let sub: AnyElement = match &tile.status {
@@ -2537,7 +2590,7 @@ impl AppView {
         let on_updates = self.page == Page::Updates;
         let on_settings = self.page == Page::Settings;
         let discord = img(themed_discord(t.text3)).w(px(17.)).h(px(13.)).flex_none().into_any_element();
-        let connected = self.devices.tiles.iter().filter(|t| matches!(t.status, TileStatus::Connected(_))).count();
+        let connected = self.visible_tiles().into_iter().filter(|t| matches!(t.status, TileStatus::Connected(_))).count();
         let status_text = match connected {
             0 => "No mouse connected".to_string(),
             1 => "1 device connected".to_string(),
@@ -2765,6 +2818,43 @@ impl AppView {
             .filter(|c| c.kind == "number" || c.kind == "stepped")
             .cloned()
             .collect();
+        // One slider per on-device DPI stage, written (debounced) as that
+        // stage's value through `perf.dpiStageValue`.
+        let (dpi_min, dpi_max, dpi_step) = r.controls.as_ref().map(|c| (c.dpi.min, c.dpi.max, c.dpi.step.max(1.0))).unwrap_or((50.0, 22000.0, 50.0));
+        let stages = r.stages.clone();
+        for (stage, value) in stages.into_iter().enumerate() {
+            let key = format!("{device}/stage/{stage}");
+            if self.control_sliders.contains_key(&key) {
+                continue;
+            }
+            let slider = cx.new(|_| {
+                SliderState::new()
+                    .min(0.0)
+                    .max((dpi_max - dpi_min) as f32)
+                    .step(dpi_step as f32)
+                    .default_value((value.clamp(dpi_min, dpi_max) - dpi_min) as f32)
+            });
+            let live_key = key.clone();
+            let sub = cx.subscribe_in(&slider, window, move |this: &mut Self, _s, event, _w, cx| {
+                let SliderEvent::Change(v) = event else { return };
+                let dpi = ((v.end() as f64 + dpi_min) / dpi_step).round() * dpi_step;
+                this.slider_live.insert(live_key.clone(), dpi);
+                this.slider_seq += 1;
+                let seq = this.slider_seq;
+                cx.notify();
+                cx.spawn(async move |view, cx| {
+                    cx.background_executor().timer(Duration::from_millis(400)).await;
+                    let _ = view.update(cx, |this: &mut Self, cx| {
+                        if this.slider_seq == seq {
+                            this.set_control("perf.dpiStageValue".into(), serde_json::json!({ "stage": stage, "dpi": dpi }), cx);
+                        }
+                    });
+                })
+                .detach();
+            });
+            self._subscriptions.push(sub);
+            self.control_sliders.insert(key, slider);
+        }
         for c in specs {
             let key = format!("{device}/{}", c.id);
             if self.control_sliders.contains_key(&key) {
@@ -3390,22 +3480,16 @@ impl AppView {
                     .child(div().text_sm().text_color(muted).child(facts.join("  ·  "))),
             );
 
-        let section = |title: &str| {
-            div()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .p_4()
-                .rounded_lg()
-                .border_1()
-                .border_color(border)
-                .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(fg).child(title.to_string()))
-        };
+        let web = crate::web_style::Tokens::read(cx);
+        let _ = border;
+        let section = |title: &str| crate::web_style::panel(&web).child(crate::web_style::panel_head(&web, None, title, None));
 
         let content: AnyElement = match &tile.status {
+            TileStatus::Connected(r) if self.devices.tab == DeviceTab::Overview => self.render_device_overview(tile, r, cx),
+            TileStatus::Connected(r) if self.devices.tab == DeviceTab::Advanced => self.render_device_advanced(tile, r, cx),
             TileStatus::Connected(r) if self.devices.tab != DeviceTab::Performance => self.render_extra_tab(r, cx),
             TileStatus::Connected(r) => {
-                let mut col = div().flex().flex_col().gap_3().flex_1().min_w_0().max_w(px(720.));
+                let mut col = div().flex().flex_col().gap(px(16.)).flex_1().min_w_0();
 
                 // Locked while a game profile is in control of this device.
                 if let Some(game) = self.locked_game() {
@@ -3416,7 +3500,10 @@ impl AppView {
 
                 // Sensitivity. Hidden when the driver reports no real DPI (a
                 // control whose Apply would fail), as the Tauri tab does.
-                if let (Some(current), Some(c)) = (r.dpi.filter(|d| *d > 0.0), &r.controls) {
+                let stage_editor = r.stages.len() > 1;
+                if stage_editor {
+                    col = col.child(self.render_stage_editor(tile, r, cx));
+                } else if let (Some(current), Some(c)) = (r.dpi.filter(|d| *d > 0.0), &r.controls) {
                     let unlinked = r.separate_axes && self.devices.unlinked_axes;
                     let cur_y = r.dpi_y.unwrap_or(current);
                     let x_now = staged.dpi.unwrap_or(current);
@@ -3503,28 +3590,7 @@ impl AppView {
                 }
 
                 if !r.polling_rates.is_empty() {
-                    let shown = staged.polling.or(r.polling_hz.map(|hz| hz as u32));
-                    // `pollingReadOnly`: the protocol says this rate can be read but not set.
-                    let read_only = r.polling_read_only;
-                    let mut row = h_flex().gap_2().flex_wrap();
-                    for rate in r.polling_rates.iter().copied() {
-                        row = row.child(self.chip(
-                            format!("poll-{rate}"),
-                            format!("{rate} Hz"),
-                            shown == Some(rate),
-                            cx,
-                            move |this, cx| {
-                                if !read_only {
-                                    this.edit("pollingRate", serde_json::json!(rate), cx)
-                                }
-                            },
-                        ));
-                    }
-                    let mut card = section("Polling rate").child(row.when(read_only, |r| r.opacity(0.45)));
-                    if read_only {
-                        card = card.child(div().text_xs().text_color(muted).child("This mouse reports its polling rate but doesn't let it be changed."));
-                    }
-                    col = col.child(card);
+                    col = col.child(self.render_report_frequency(r, cx));
                 }
 
                 let lod_options: Vec<String> =
@@ -3579,8 +3645,12 @@ impl AppView {
                 // debounce, low-power threshold, USB speed, primary button…), from the
                 // shared JS with the Tauri tab's own gating. These apply immediately.
                 for group in &r.tabs.performance {
+                    let controls: Vec<_> = group.controls.iter().filter(|c| !(stage_editor && c.id == "perf.dpiStage")).collect();
+                    if controls.is_empty() {
+                        continue;
+                    }
                     let mut card = section(&group.title);
-                    for control in &group.controls {
+                    for control in controls {
                         card = card.child(self.render_control(control, cx));
                     }
                     col = col.child(card);
@@ -3608,79 +3678,156 @@ impl AppView {
             }
             _ => None,
         };
-        let sidebar = if self.sidebar_collapsed { SIDEBAR_COLLAPSED_W } else { SIDEBAR_W };
-        let art_side = ((view_width - sidebar - 2.0 * PAGE_PAD) * 0.36).clamp(260.0, 520.0);
-
-        let mut tab_bar = h_flex().gap_1();
-        // Only tabs this device has something for: Buttons if its driver (or a
-        // Logitech profile) has remappable buttons, Lighting if it reports
-        // lighting, Advanced if its brand has extras.
-        let (has_buttons, has_lighting, has_advanced, has_profiles) = match &tile.status {
-            TileStatus::Connected(r) => (
-                !r.tabs.buttons.is_empty() || r.onboard_profiles,
-                r.tabs.lighting.is_some(),
-                !r.tabs.advanced.is_empty(),
-                r.onboard_profiles,
-            ),
-            _ => (false, false, false, false),
+        let _ = (firmware, view_width, fg, &header);
+        use crate::web_style::{alpha, icon_el, Lucide, R_MD, R_SM};
+        let t = web;
+        // Only tabs this device has something for, as before; Overview and
+        // Advanced (diagnostics) always.
+        let (has_buttons, has_lighting, has_profiles) = match &tile.status {
+            TileStatus::Connected(r) => (!r.tabs.buttons.is_empty() || r.onboard_profiles, r.tabs.lighting.is_some(), r.onboard_profiles),
+            _ => (false, false, false),
         };
-        let tabs: Vec<DeviceTab> = [
-            (DeviceTab::Performance, true),
-            (DeviceTab::Buttons, has_buttons),
-            (DeviceTab::Lighting, has_lighting),
-            (DeviceTab::Advanced, has_advanced),
-            (DeviceTab::Profiles, has_profiles),
+        let tabs: Vec<(DeviceTab, Lucide)> = [
+            (DeviceTab::Overview, Lucide::Gauge, true),
+            (DeviceTab::Performance, Lucide::ChartColumn, true),
+            (DeviceTab::Buttons, Lucide::MousePointer, has_buttons),
+            (DeviceTab::Lighting, Lucide::Activity, has_lighting),
+            (DeviceTab::Profiles, Lucide::LayoutGrid, has_profiles),
+            (DeviceTab::Advanced, Lucide::Sliders, true),
         ]
         .into_iter()
-        .filter_map(|(tab, shown)| shown.then_some(tab))
+        .filter_map(|(tab, glyph, shown)| shown.then_some((tab, glyph)))
         .collect();
-        for tab in tabs {
-            tab_bar = tab_bar.child(self.chip(
-                format!("tab-{}", tab.label()),
-                tab.label().to_string(),
-                self.devices.tab == tab,
-                cx,
-                move |this, cx| {
-                    this.devices.tab = tab;
-                    // Logitech's stored profiles back both tabs; read them once.
-                    if has_profiles
-                        && matches!(tab, DeviceTab::Profiles | DeviceTab::Buttons)
-                        && this.devices.onboard.is_none()
-                    {
-                        this.load_onboard_profiles(cx);
-                    }
-                    cx.notify();
-                },
-            ));
+        // `.om-tabs`: a 40px well (4px padding and gap, radius 10) of 32px keys.
+        let mut tab_bar = h_flex().p(px(4.)).gap(px(4.)).h(px(40.)).rounded(px(R_MD)).bg(hsla(0., 0., 0., 0.26)).border_1().border_color(t.line(1));
+        for (tab, glyph) in tabs {
+            let active = self.devices.tab == tab;
+            tab_bar = tab_bar.child(
+                div()
+                    .id(SharedString::from(format!("tab-{}", tab.label())))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .h(px(32.))
+                    .px(px(12.))
+                    .rounded(px(R_SM))
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .cursor_pointer()
+                    .text_color(if active { t.text1 } else { t.text2 })
+                    .when(active, |k| k.bg(t.surface(4)).border_1().border_color(t.lit()))
+                    .when(!active, |k| k.hover(|k| k.text_color(t.text1).bg(t.glint())))
+                    .child(icon_el(glyph, if active { t.accent } else { t.text3 }, 15.))
+                    .child(tab.label())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.devices.tab = tab;
+                        if has_profiles && matches!(tab, DeviceTab::Profiles | DeviceTab::Buttons) && this.devices.onboard.is_none() {
+                            this.load_onboard_profiles(cx);
+                        }
+                        cx.notify();
+                    })),
+            );
         }
 
+        // The rail: breadcrumb, name, connection, then the render alone.
+        let (live, connection) = match &tile.status {
+            TileStatus::Connected(r) => (true, r.connection.clone()),
+            _ => (false, None),
+        };
+        let crumb = h_flex()
+            .items_center()
+            .gap(px(8.))
+            .text_size(px(11.))
+            .text_color(t.text3)
+            .child(
+                div()
+                    .id("crumb-devices")
+                    .cursor_pointer()
+                    .hover(|c| c.text_color(t.text1))
+                    .child("Devices")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.devices.open = None;
+                        this.devices.write_error = None;
+                        this.devices.staged = Staged::default();
+                        cx.notify();
+                    })),
+            )
+            .child(icon_el(Lucide::ChevronRight, t.text4, 11.))
+            .child(div().truncate().child(tile.name.clone()));
+        let status_row = h_flex()
+            .items_center()
+            .gap(px(14.))
+            .text_size(px(12.))
+            .text_color(t.text2)
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap(px(7.))
+                    .child(div().size(px(7.)).rounded_full().bg(if live { t.ok } else { t.text4 }))
+                    .child(match &tile.status {
+                        TileStatus::Connected(_) => "Connected",
+                        TileStatus::Connecting => "Connecting…",
+                        _ => "Not connected",
+                    }),
+            )
+            .children(connection.map(|c| {
+                let wired = c == "Wired";
+                h_flex().items_center().gap(px(6.)).child(icon_el(if wired { Lucide::Plug } else { Lucide::Wifi }, t.text3, 14.)).child(c)
+            }));
+        let rail = div()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .flex_none()
+            .w(px(280.))
+            .child(crumb)
+            .child(div().text_size(px(22.)).font_weight(FontWeight(650.)).text_color(t.text1).line_height(px(28.)).child(tile.name.clone()))
+            .child(status_row)
+            .child(div().pt(px(8.)).child(self.device_art(tile, 280., 1.15)));
+
         let show_bar = !instant && !staged.is_empty();
+        // `.om-pending`: the floating pending-changes bar.
         let apply_bar = div()
             .absolute()
-            .left(px(PAGE_PAD))
-            .right(px(PAGE_PAD))
-            .bottom(px(PAGE_PAD))
+            .left(px(32.))
+            .right(px(32.))
+            .bottom(px(20.))
             .flex()
             .flex_row()
             .items_center()
             .justify_between()
             .gap_3()
-            .px_4()
-            .py_3()
-            .rounded_lg()
+            .px(px(16.))
+            .py(px(10.))
+            .rounded(px(14.))
             .border_1()
-            .border_color(cx.theme().primary)
-            .bg(cx.theme().sidebar)
-            .shadow_lg()
-            .child(div().text_sm().text_color(fg).child("You have unsaved changes"))
+            .border_color(t.line(2))
+            .bg(alpha(t.ink1, 0.97))
+            .shadow(vec![BoxShadow { color: hsla(0., 0., 0., 0.6), offset: point(px(0.), px(18.)), blur_radius: px(44.), spread_radius: px(-14.), inset: false }])
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(div().size(px(8.)).rounded_full().bg(t.warn))
+                    .child(div().text_size(px(13.)).text_color(t.text1).child("Unsaved changes")),
+            )
             .child(
                 h_flex()
                     .gap_2()
                     .child(
-                        Button::new("revert")
-                            .ghost()
-                            .compact()
-                            .label("Revert")
+                        div()
+                            .id("revert")
+                            .flex()
+                            .items_center()
+                            .h(px(32.))
+                            .px(px(12.))
+                            .rounded(px(R_SM))
+                            .cursor_pointer()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(t.text2)
+                            .hover(|b| b.bg(t.glint()).text_color(t.text1))
+                            .child("Revert")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.devices.staged = Staged::default();
                                 this.devices.write_error = None;
@@ -3688,58 +3835,406 @@ impl AppView {
                             })),
                     )
                     .child(
-                        Button::new("apply-changes")
-                            .compact()
-                            .label(if busy { "Applying…" } else { "Apply Changes" })
+                        div()
+                            .id("apply-changes")
+                            .flex()
+                            .items_center()
+                            .h(px(32.))
+                            .px(px(14.))
+                            .rounded(px(R_SM))
+                            .cursor_pointer()
+                            .bg(t.accent)
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(t.on_accent)
+                            .child(if busy { "Applying…" } else { "Apply changes" })
                             .on_click(cx.listener(|this, _, _, cx| this.apply_staged(cx))),
                     ),
             );
 
+        let tab_key = self.devices.tab as u64;
         div()
             .relative()
             .size_full()
             .child(
                 div()
-                    .flex()
-                    .flex_col()
+                    .id("device-page")
                     .size_full()
-                    .p_4()
-                    .gap_4()
-                    .when(show_bar, |this| this.pb(px(96.)))
                     .overflow_y_scrollbar()
-                    .child(header)
                     .child(
                         h_flex()
-                            .gap_6()
                             .items_start()
+                            .gap(px(16.))
+                            .pt(px(28.))
+                            .px(px(32.))
+                            .pb(px(if show_bar { 96. } else { 40. }))
+                            .child(rail)
                             .child(
                                 div()
                                     .flex()
                                     .flex_col()
-                                    .items_center()
-                                    .gap_2()
-                                    .flex_none()
-                                    .child(self.device_art(tile, art_side, 1.4))
-                                    .when_some(firmware, |this, fw| {
-                                        this.child(div().text_xs().text_color(muted).child(fw))
-                                    }),
-                            )
-                            // Tabs sit directly over the controls they switch.
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_3()
+                                    .gap(px(16.))
                                     .flex_1()
                                     .min_w_0()
-                                    .max_w(px(720.))
-                                    .child(tab_bar)
-                                    .child(content),
+                                    .child(h_flex().child(tab_bar))
+                                    .child(
+                                        div()
+                                            .relative()
+                                            .child(content)
+                                            .with_animation(
+                                                ElementId::NamedInteger("tab-enter".into(), tab_key),
+                                                Animation::new(Duration::from_millis(220)).with_easing(gpui_kit::base::animation::ease_out_cubic),
+                                                |el, delta| el.opacity(delta).top(px(6.0 * (1.0 - delta))),
+                                            ),
+                                    ),
                             ),
                     ),
             )
             .when(show_bar, |this| this.child(apply_bar))
             .into_any_element()
+    }
+
+    /// Overview tab (`DeviceOverview` in the web app): current setup figures,
+    /// the DPI stage chips, and battery over time.
+    fn render_device_overview(&self, tile: &Tile, r: &DeviceReadout, cx: &mut Context<Self>) -> AnyElement {
+        use crate::web_style::{figure, group, panel, panel_head, Tokens, R_SM};
+        let t = Tokens::read(cx);
+        let column = |label: &str, value: AnyElement, meta: Option<String>, first: bool| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .flex_1()
+                .min_w_0()
+                .when(!first, |c| c.pl(px(20.)).border_l_1().border_color(t.line(1)))
+                .child(div().text_size(px(12.)).text_color(t.text3).child(label.to_string()))
+                .child(value)
+                .children(meta.map(|m| div().text_size(px(12.)).text_color(t.text3).child(m)))
+        };
+        let dash = || div().text_size(px(30.)).text_color(t.text4).child("–").into_any_element();
+        let sensitivity = match r.dpi.filter(|d| *d > 0.0) {
+            Some(dpi) => figure(&t, group(dpi), "DPI", 30.).into_any_element(),
+            None => dash(),
+        };
+        let stage_meta = r.active_stage.filter(|_| r.stages.len() > 1).map(|a| format!("Stage {} of {}", a + 1, r.stages.len()));
+        let polling = match r.polling_hz {
+            Some(hz) => figure(&t, group(hz), "Hz", 30.).into_any_element(),
+            None => dash(),
+        };
+        let battery = match r.battery {
+            Some(b) => figure(&t, format!("{}", b.round() as i64), "%", 30.).into_any_element(),
+            None => dash(),
+        };
+        let battery_meta = r.battery.map(|_| if r.charging { "Charging".to_string() } else { "Discharging".to_string() });
+        let mut setup = panel(&t)
+            .gap(px(0.))
+            .p(px(0.))
+            .child(div().p(px(16.)).child(panel_head(&t, None, "Current setup", Some("Read from the device"))))
+            .child(
+                h_flex()
+                    .items_start()
+                    .px(px(16.))
+                    .pb(px(18.))
+                    .child(column("Sensitivity", sensitivity, stage_meta, true))
+                    .child(column("Polling rate", polling, None, false))
+                    .child(column("Battery", battery, battery_meta, false)),
+            );
+        if r.stages.len() > 1 {
+            let mut chips = h_flex().items_center().gap(px(6.)).flex_wrap();
+            for (i, dpi) in r.stages.iter().enumerate() {
+                let active = r.active_stage == Some(i);
+                chips = chips.child(
+                    div()
+                        .id(("overview-stage", i))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .h(px(30.))
+                        .px(px(14.))
+                        .rounded(px(R_SM))
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .cursor_pointer()
+                        .bg(if active { t.surface(3) } else { t.surface(1) })
+                        .border_1()
+                        .border_color(t.lit())
+                        .text_color(if active { t.text1 } else { t.text2 })
+                        .hover(|c| c.bg(t.surface(2)))
+                        .when(active, |c| c.child(div().size(px(6.)).rounded_full().bg(t.ok)))
+                        .child(group(*dpi))
+                        .on_click(cx.listener(move |this, _, _, cx| this.set_control("perf.dpiStage".into(), serde_json::json!(i), cx))),
+                );
+            }
+            setup = setup.child(
+                h_flex()
+                    .items_center()
+                    .gap(px(16.))
+                    .px(px(16.))
+                    .py(px(12.))
+                    .border_t_1()
+                    .border_color(t.line(1))
+                    .child(div().text_size(px(13.)).text_color(t.text2).child("DPI stages"))
+                    .child(chips),
+            );
+        }
+
+        // Battery over time: the readings this app has taken, as bars.
+        let log = self.monitor.battery_log.get(&tile.key).cloned().unwrap_or_default();
+        let mut chart = h_flex().items_end().gap(px(2.)).h(px(130.)).w_full().border_b_1().border_color(t.line(1));
+        if log.len() >= 2 {
+            for (_, percent) in log.iter().rev().take(96).rev() {
+                chart = chart.child(div().flex_1().max_w(px(10.)).h(relative(f32::from(*percent).max(2.0) / 100.0)).rounded_t(px(2.)).bg(crate::web_style::alpha(t.accent, 0.55)));
+            }
+        }
+        let since = log.first().and_then(|(at, _)| at.elapsed().ok()).map(|d| {
+            let minutes = d.as_secs() / 60;
+            if minutes < 60 { format!("{minutes} min ago") } else { format!("{} h ago", minutes / 60) }
+        });
+        let battery_panel = panel(&t)
+            .flex_1()
+            .min_w_0()
+            .child(panel_head(&t, None, "Battery over time", Some("Recorded while this app is open")))
+            .child(if log.len() >= 2 {
+                div().flex().flex_col().gap(px(8.)).child(chart).child(
+                    h_flex()
+                        .justify_between()
+                        .text_size(px(11.))
+                        .text_color(t.text3)
+                        .child(since.unwrap_or_default())
+                        .child("Now"),
+                ).into_any_element()
+            } else {
+                div().h(px(130.)).flex().items_center().justify_center().text_size(px(12.)).text_color(t.text3).child(if r.battery.is_some() {
+                    "Readings appear here as the battery changes."
+                } else {
+                    "This mouse does not report its battery over this connection."
+                }).into_any_element()
+            });
+        let device_panel = panel(&t)
+            .flex_1()
+            .min_w_0()
+            .child(panel_head(&t, None, "Device", None))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .text_size(px(13.))
+                    .child(h_flex().justify_between().child(div().text_color(t.text3).child("Model")).child(div().text_color(t.text1).child(tile.name.clone())))
+                    .child(h_flex().justify_between().child(div().text_color(t.text3).child("Connection")).child(div().text_color(t.text1).child(r.connection.clone().unwrap_or_else(|| "–".into()))))
+                    .child(h_flex().justify_between().child(div().text_color(t.text3).child("Firmware")).child(div().text_color(t.text1).child(if r.firmware.is_empty() { "Not reported".to_string() } else { r.firmware.join(" · ") }))),
+            );
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(16.))
+            .child(setup)
+            .child(h_flex().items_start().gap(px(16.)).child(battery_panel).child(device_panel))
+            .into_any_element()
+    }
+
+    /// Performance › Sensitivity in stages (`DpiStagesEditor`): one row per
+    /// stage with its number (click to make it active), value and slider.
+    fn render_stage_editor(&self, tile: &Tile, r: &DeviceReadout, cx: &mut Context<Self>) -> AnyElement {
+        use crate::web_style::{alpha, figure, group, icon_el, panel, panel_head, Lucide, Tokens, R_SM};
+        let t = Tokens::read(cx);
+        let current = r.active_stage.and_then(|a| r.stages.get(a).copied()).or(r.dpi).unwrap_or(0.0);
+        let mut rows = div().flex().flex_col().border_t_1().border_color(t.line(1));
+        for (i, dpi) in r.stages.iter().enumerate() {
+            let active = r.active_stage == Some(i);
+            let key = format!("{}/stage/{i}", tile.key);
+            let live = self.slider_live.get(&key).copied().unwrap_or(*dpi);
+            let slider = self.control_sliders.get(&key).cloned();
+            rows = rows.child(
+                h_flex()
+                    .items_center()
+                    .gap(px(14.))
+                    .h(px(55.))
+                    .px(px(4.))
+                    .border_b_1()
+                    .border_color(t.line(1))
+                    .when(active, |row| row.bg(alpha(t.accent, 0.07)))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .flex_none()
+                            .size(px(20.))
+                            .rounded(px(4.))
+                            .border_1()
+                            .border_color(t.line(3))
+                            .child(icon_el(Lucide::Check, t.text2, 13.)),
+                    )
+                    .child(
+                        div()
+                            .id(("stage-number", i))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .flex_none()
+                            .size(px(36.))
+                            .rounded(px(R_SM))
+                            .cursor_pointer()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(if active { t.accent } else { t.text2 })
+                            .when(active, |n| n.bg(alpha(t.accent, 0.16)))
+                            .when(!active, |n| n.hover(|n| n.bg(t.glint())))
+                            .child(format!("{}", i + 1))
+                            .on_click(cx.listener(move |this, _, _, cx| this.set_control("perf.dpiStage".into(), serde_json::json!(i), cx))),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .flex_none()
+                            .w(px(116.))
+                            .h(px(36.))
+                            .px(px(14.))
+                            .rounded(px(R_SM))
+                            .bg(hsla(0., 0., 0., 0.26))
+                            .border_1()
+                            .border_color(t.line(1))
+                            .text_size(px(14.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(t.text1)
+                            .child(format!("{}", live.round() as i64)),
+                    )
+                    .child(div().flex_1().min_w_0().children(slider.map(|s| Slider::new(&s).bg(t.accent).text_color(t.text1)))),
+            );
+        }
+        let count = r.stages.len();
+        panel(&t)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .child(panel_head(&t, Some(Lucide::Crosshair), "Sensitivity", None))
+                    .child(figure(&t, group(current), "DPI", 30.)),
+            )
+            .child(
+                h_flex()
+                    .justify_between()
+                    .text_size(px(13.))
+                    .text_color(t.text2)
+                    .child("Stages in use")
+                    .child(format!("{count} / {count}")),
+            )
+            .child(rows)
+            .child(div().text_size(px(13.)).text_color(t.text3).child(format!(
+                "One row per DPI stage, {count} fixed. Drag a slider to change its value. Click a number to make it the active stage."
+            )))
+            .into_any_element()
+    }
+
+    /// Performance › Report frequency: a well of keys with growing bars.
+    fn render_report_frequency(&self, r: &DeviceReadout, cx: &mut Context<Self>) -> AnyElement {
+        use crate::web_style::{alpha, figure, group, panel, panel_head, Lucide, Tokens, R_SM};
+        let t = Tokens::read(cx);
+        let shown = self.devices.staged.polling.or(r.polling_hz.map(|hz| hz as u32));
+        let read_only = r.polling_read_only;
+        let count = r.polling_rates.len().max(1);
+        let mut well = h_flex().gap(px(4.)).p(px(4.)).rounded(px(10.)).bg(hsla(0., 0., 0., 0.26)).border_1().border_color(t.line(1));
+        for (i, rate) in r.polling_rates.iter().copied().enumerate() {
+            let active = shown == Some(rate);
+            let label = if rate >= 1000 && rate % 1000 == 0 { format!("{}K", rate / 1000) } else { rate.to_string() };
+            let bar_h = 10.0 + 14.0 * (i as f32 + 1.0) / count as f32;
+            let tone = if active { t.accent } else { alpha(t.accent, 0.3 + 0.45 * (i as f32 + 1.0) / count as f32) };
+            well = well.child(
+                div()
+                    .id(("rate-key", i))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(10.))
+                    .flex_1()
+                    .h(px(88.))
+                    .pb(px(12.))
+                    .rounded(px(R_SM))
+                    .cursor_pointer()
+                    .when(active, |k| k.bg(t.surface(4)).border_1().border_color(t.lit()))
+                    .when(!active, |k| k.hover(|k| k.bg(t.glint())))
+                    .child(div().w(px(42.)).h(px(bar_h)).rounded(px(3.)).bg(tone))
+                    .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(if active { t.text1 } else { t.text2 }).child(label))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !read_only {
+                            this.edit("pollingRate", serde_json::json!(rate), cx)
+                        }
+                    })),
+            );
+        }
+        panel(&t)
+            .max_w(px(560.))
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .child(panel_head(&t, Some(Lucide::Activity), "Report frequency", None))
+                    .child(figure(&t, shown.map(|hz| group(hz as f64)).unwrap_or_else(|| "–".into()), "Hz", 30.)),
+            )
+            .child(div().text_size(px(13.)).text_color(t.text2).child(if read_only {
+                "This mouse reports its polling rate but doesn't let it be changed."
+            } else {
+                "Higher rates update cursor movement more often, but use more battery."
+            }))
+            .child(well.when(read_only, |w| w.opacity(0.45)))
+            .into_any_element()
+    }
+
+    /// Advanced tab: the device's own advanced controls, then Diagnostics.
+    fn render_device_advanced(&self, tile: &Tile, r: &DeviceReadout, cx: &mut Context<Self>) -> AnyElement {
+        use crate::web_style::{icon_el, panel, Lucide, Tokens};
+        let t = Tokens::read(cx);
+        let open = self.devices.expanded.as_deref() == Some("diagnostics");
+        let mut col = div().flex().flex_col().gap(px(16.));
+        if !r.tabs.advanced.is_empty() {
+            col = col.child(self.render_extra_tab(r, cx));
+        }
+        col = col.child(div().text_size(px(13.)).text_color(t.text2).child(
+            "Record the device identifier, protocol version, and any failing setting in the issue or pull request. Do not use factory reset during initial testing.",
+        ));
+        let fact = |label: &str, value: String| {
+            h_flex().justify_between().gap(px(16.)).text_size(px(13.)).child(div().text_color(t.text3).child(label.to_string())).child(div().text_color(t.text1).child(value))
+        };
+        let mut diag = panel(&t).p(px(0.)).gap(px(0.)).child(
+            h_flex()
+                .id("diagnostics-toggle")
+                .items_center()
+                .justify_between()
+                .px(px(20.))
+                .h(px(62.))
+                .cursor_pointer()
+                .child(div().text_size(px(17.)).font_weight(FontWeight::SEMIBOLD).text_color(t.text1).child("Diagnostics"))
+                .child(icon_el(Lucide::ChevronDown, t.text3, 16.))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.devices.expanded = if this.devices.expanded.as_deref() == Some("diagnostics") { None } else { Some("diagnostics".into()) };
+                    cx.notify();
+                })),
+        );
+        if open {
+            diag = diag.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.))
+                    .px(px(20.))
+                    .pb(px(18.))
+                    .pt(px(4.))
+                    .border_t_1()
+                    .border_color(t.line(1))
+                    .child(fact("Device", tile.name.clone()))
+                    .child(fact("Identifier", tile.key.clone()))
+                    .child(fact("Driver", tile.brand.clone()))
+                    .child(fact("Connection", r.connection.clone().unwrap_or_else(|| "–".into())))
+                    .child(fact("Firmware", if r.firmware.is_empty() { "Not reported".into() } else { r.firmware.join(" · ") }))
+                    .child(fact("Battery", r.battery.map(|b| format!("{b:.0}%")).unwrap_or_else(|| "Not reported".into())))
+                    .child(fact("DPI stages", if r.stages.is_empty() { "–".into() } else { r.stages.iter().map(|d| format!("{d:.0}")).collect::<Vec<_>>().join(", ") })),
+            );
+        }
+        col.child(diag).into_any_element()
     }
 
     /// Overview: the connected mouse and its artwork, read through the shared
@@ -3758,6 +4253,31 @@ impl AppView {
 
     /// The device the profile screen is editing: the one picked, else the first
     /// connected, else the first listed.
+    /// The tiles to show: one card per mouse. A receiver with no mouse is
+    /// hidden while a mouse of the same maker is connected another way, and the
+    /// same mouse by cable and through its receiver shows once (the cable,
+    /// which is the link in use).
+    fn visible_tiles(&self) -> Vec<&Tile> {
+        let tiles = &self.devices.tiles;
+        let vendor = |t: &Tile| t.key.split(':').next().unwrap_or_default().to_string();
+        let named = |t: &Tile| matches!(t.status, TileStatus::Connected(_)) && !t.name.contains("receiver");
+        let wired = |t: &Tile| matches!(&t.status, TileStatus::Connected(r) if r.connection.as_deref() == Some("Wired"));
+        let mut out: Vec<&Tile> = Vec::new();
+        for t in tiles {
+            if t.name.contains("receiver") && tiles.iter().any(|o| o.key != t.key && vendor(o) == vendor(t) && named(o)) {
+                continue;
+            }
+            if let Some(pos) = out.iter().position(|o| !t.name.is_empty() && o.name == t.name) {
+                if wired(t) && !wired(out[pos]) {
+                    out[pos] = t;
+                }
+                continue;
+            }
+            out.push(t);
+        }
+        out
+    }
+
     /// The web Devices page (`features/devices/DevicesHome.tsx`, `home.css`):
     /// title and line, then the shelf of device blocks ending in Add device.
     fn render_devices_home(&self, view_width: f32, view_height: f32, cx: &mut Context<Self>) -> AnyElement {
@@ -3788,7 +4308,7 @@ impl AppView {
         };
 
         let mut shelf = h_flex().flex_wrap().justify_center().items_start().gap(px(16.));
-        for tile in &self.devices.tiles {
+        for tile in self.visible_tiles() {
             let live = matches!(tile.status, TileStatus::Connected(_));
             let key = tile.key.clone();
             let brand = if tile.display_brand.is_empty() { tile.brand.clone() } else { tile.display_brand.clone() };
@@ -3881,7 +4401,17 @@ impl AppView {
                             inset: false,
                         }]),
                 )
-                .child(self.device_art(tile, 250., 1.0));
+                .child({
+                    let hovered = self.monitor.hovered.as_deref() == Some(tile.key.as_str());
+                    div().relative().child(self.device_art(tile, 250., 1.0)).with_animation(
+                        ElementId::Name(format!("lift-{}-{}", tile.key, hovered as u8).into()),
+                        Animation::new(Duration::from_millis(260)).with_easing(gpui_kit::base::animation::ease_out_cubic),
+                        move |el, delta| {
+                            let lift = if hovered { delta } else { 1.0 - delta };
+                            el.top(px(-6.0 * lift))
+                        },
+                    )
+                });
 
             let action = match &tile.status {
                 TileStatus::Connected(_) => button(SharedString::from(format!("configure-{}", tile.key)), "Configure".into(), true, true),
@@ -3910,6 +4440,16 @@ impl AppView {
                 .when(!live, |b| b.hover(|b| b.bg(t.surface(2))))
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _, _, cx| this.open_device(&key, cx)))
+                .on_hover({
+                    let hover_key = tile.key.clone();
+                    cx.listener(move |this, hovered: &bool, _, cx| {
+                        let next = if *hovered { Some(hover_key.clone()) } else { None };
+                        if this.monitor.hovered != next && (*hovered || this.monitor.hovered.as_deref() == Some(hover_key.as_str())) {
+                            this.monitor.hovered = next;
+                            cx.notify();
+                        }
+                    })
+                })
                 .child(top)
                 .child(div().text_size(px(12.)).text_color(t.text3).child(meta))
                 .child(stats)
@@ -3947,7 +4487,14 @@ impl AppView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(img(add_device_art()).w(px(190.)).h(px(190.)).object_fit(ObjectFit::Contain).opacity(0.5)),
+                    .child({
+                        let index = (self.monitor.ticks / 2) as usize;
+                        img(add_device_art(index)).w(px(190.)).h(px(190.)).object_fit(ObjectFit::Contain).with_animation(
+                            ElementId::NamedInteger("showcase".into(), index as u64),
+                            Animation::new(Duration::from_millis(900)).with_easing(gpui_kit::base::animation::ease_out_cubic),
+                            |el, delta| el.opacity(0.55 * delta),
+                        )
+                    }),
             )
             .child(
                 button("rescan".into(), if self.devices.scanning { "Scanning…".into() } else { "Add device".into() }, false, !self.devices.scanning)
@@ -3978,7 +4525,11 @@ impl AppView {
                             .child(div().text_size(px(13.)).text_color(t.text2).child("Devices this app can open. Pick one to change its settings.")),
                     )
                     .children(self.devices.error.clone().map(|e| div().text_size(px(12.)).text_color(t.bad).child(e)))
-                    .child(div().flex_1().flex().items_center().justify_center().child(shelf)),
+                    .child(div().flex_1().flex().items_center().justify_center().child(shelf.with_animation(
+                        "home-enter",
+                        Animation::new(Duration::from_millis(320)).with_easing(gpui_kit::base::animation::ease_out_cubic),
+                        |el, delta| el.opacity(delta).mt(px(10.0 * (1.0 - delta))),
+                    ))),
             )
             .into_any_element()
     }

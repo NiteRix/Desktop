@@ -32,8 +32,8 @@ const BUNDLE: &str = include_str!("../js/dist/bundle.js");
 /// the binary so installed builds can show it (see `fetch_original`).
 const EMBEDDED_ART: &[(&str, &[u8])] = &[
     ("attackshark-x11.png", include_bytes!("../../public/devices/attackshark-x11.png")),
-    ("attackshark-x8-se.png", include_bytes!("../../public/devices/attackshark-x8-se.png")),
-    ("attackshark-r1.png", include_bytes!("../../public/devices/attackshark-r1.png")),
+    ("attackshark-x8-se-official.png", include_bytes!("../../public/devices/attackshark-x8-se-official.png")),
+    ("attackshark-r1-official.png", include_bytes!("../../public/devices/attackshark-r1-official.png")),
     ("keychron-nape-pro.png", include_bytes!("../../public/devices/keychron-nape-pro.png")),
     ("logitech-mx-master-4.png", include_bytes!("../../public/devices/logitech-mx-master-4.png")),
     ("pulsar-pro-dongle.png", include_bytes!("../../public/devices/pulsar-pro-dongle.png")),

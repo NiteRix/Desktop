@@ -3861,6 +3861,7 @@ impl AppView {
                             offset: point(px(0.), px(0.)),
                             blur_radius: px(70.),
                             spread_radius: px(24.),
+                            inset: false,
                         }]),
                 );
             }
@@ -3877,6 +3878,7 @@ impl AppView {
                             offset: point(px(0.), px(0.)),
                             blur_radius: px(10.),
                             spread_radius: px(0.),
+                            inset: false,
                         }]),
                 )
                 .child(self.device_art(tile, 250., 1.0));

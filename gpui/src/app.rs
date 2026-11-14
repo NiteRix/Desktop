@@ -354,6 +354,25 @@ fn hex_color(hex: &str) -> Hsla {
     rgb(v).into()
 }
 
+/// How often the monitor looks for plugged/unplugged devices and re-reads
+/// battery (Bridge reads batteries on an interval for the same reasons).
+const MONITOR_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+/// Battery level that turns the tray red and raises the low-battery alert
+/// (Bridge's default threshold).
+const LOW_BATTERY_PERCENT: u8 = 20;
+/// One low-battery alert per mouse per this long (Bridge's default cooldown).
+const LOW_BATTERY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+#[derive(Default)]
+struct Monitor {
+    started: bool,
+    busy: bool,
+    /// Devices that appeared after launch: announced once their status reads.
+    announce: std::collections::HashSet<String>,
+    /// When each mouse last raised the low-battery alert.
+    low_alerted: std::collections::HashMap<String, std::time::Instant>,
+}
+
 struct Tile {
     key: String,
     name: String,
@@ -505,6 +524,8 @@ pub struct AppView {
     /// Bumped on every theme change; the ASCII field's animation id carries
     /// it, so each switch replays the entrance.
     theme_seq: u64,
+    /// Background device watch: plugs, unplugs, battery, tray and alerts.
+    monitor: Monitor,
 }
 
 /// Theme swatches in Settings, in display order. Narrows the web app's seven
@@ -637,6 +658,7 @@ impl AppView {
             ascii_rows: Vec::new(),
             ascii_dims: (0, 0),
             theme_seq: 0,
+            monitor: Monitor::default(),
         };
         // The OS entry is the truth for launch-on-startup, not the saved flag.
         view.profiles = crate::profiles::Profiles::load();
@@ -645,6 +667,7 @@ impl AppView {
             view.set_discord(true, cx);
         }
         view.scan_devices(cx);
+        view.start_monitor(cx);
         view
     }
 
@@ -690,6 +713,7 @@ impl Default for AppView {
             ascii_rows: Vec::new(),
             ascii_dims: (0, 0),
             theme_seq: 0,
+            monitor: Monitor::default(),
         }
     }
 }
@@ -885,6 +909,169 @@ impl AppView {
                 cx.notify();
             }
         });
+    }
+
+    /// Starts the background watch (see [`Monitor`]).
+    fn start_monitor(&mut self, cx: &mut Context<Self>) {
+        if self.monitor.started {
+            return;
+        }
+        self.monitor.started = true;
+        cx.spawn(async move |view, cx| loop {
+            cx.background_executor().timer(MONITOR_EVERY).await;
+            if view.update(cx, |v: &mut Self, cx| v.monitor_tick(cx)).is_err() {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    /// Adds devices that were plugged in, drops ones that were unplugged and
+    /// re-reads every connected device's status (battery above all).
+    fn monitor_tick(&mut self, cx: &mut Context<Self>) {
+        if self.monitor.busy || self.devices.scanning {
+            return;
+        }
+        self.monitor.busy = true;
+        let service = self.hid_service();
+        cx.spawn(async move |view, cx| {
+            let Ok(Ok(candidates)) = service.list_candidates().await else {
+                let _ = view.update(cx, |v: &mut Self, _| v.monitor.busy = false);
+                return;
+            };
+            let mut refresh: Vec<String> = Vec::new();
+            let mut added: Vec<(String, String)> = Vec::new();
+            let _ = view.update(cx, |v: &mut Self, cx| {
+                let keys: Vec<&str> = candidates.iter().map(|c| c.info.key.as_str()).collect();
+                let before = v.devices.tiles.len();
+                v.devices.tiles.retain(|t| keys.contains(&t.key.as_str()));
+                let removed = before != v.devices.tiles.len();
+                if v.devices.open.as_ref().is_some_and(|key| !keys.contains(&key.as_str())) {
+                    v.devices.open = None;
+                }
+                for c in &candidates {
+                    if v.devices.tiles.iter().any(|t| t.key == c.info.key) {
+                        continue;
+                    }
+                    v.devices.tiles.push(Tile {
+                        key: c.info.key.clone(),
+                        name: c.info.product_string.clone(),
+                        brand: c.brands.first().cloned().unwrap_or_default(),
+                        display_brand: c.brands.first().cloned().unwrap_or_default(),
+                        art: None,
+                        status: TileStatus::Idle,
+                    });
+                    v.monitor.announce.insert(c.info.key.clone());
+                    added.push((c.info.key.clone(), c.info.product_string.clone()));
+                }
+                v.devices.selected = v.devices.selected.min(v.devices.tiles.len().saturating_sub(1));
+                refresh = v
+                    .devices
+                    .tiles
+                    .iter()
+                    .filter(|t| matches!(t.status, TileStatus::Connected(_) | TileStatus::Idle))
+                    .map(|t| t.key.clone())
+                    .collect();
+                if removed || !added.is_empty() {
+                    v.update_tray();
+                    cx.notify();
+                }
+            });
+            for (key, name) in &added {
+                Self::load_art(&service, key, name, &view, cx).await;
+            }
+            for key in refresh {
+                let _ = view.update(cx, |v: &mut Self, cx| v.refresh_tile(&key, cx));
+            }
+            let _ = view.update(cx, |v: &mut Self, _| v.monitor.busy = false);
+        })
+        .detach();
+    }
+
+    /// Re-reads one device's status in the background without touching which
+    /// device is selected or showing "Connecting…".
+    fn refresh_tile(&mut self, key: &str, cx: &mut Context<Self>) {
+        let service = self.hid_service();
+        let key = key.to_string();
+        cx.spawn(async move |view, cx| {
+            let connected = service.connect(&key).await;
+            let mut new_name = None;
+            let _ = view.update(cx, |v: &mut Self, cx| {
+                let Some(tile) = v.devices.tiles.iter_mut().find(|t| t.key == key) else { return };
+                let Ok(Ok(device)) = connected else {
+                    if matches!(tile.status, TileStatus::Idle) {
+                        tile.status = TileStatus::Failed("No driver answered on this interface.".into());
+                    }
+                    return;
+                };
+                if let Some(name) = device
+                    .status
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .filter(|n| !n.is_empty() && *n != tile.name)
+                {
+                    tile.name = name.to_string();
+                    new_name = Some(name.to_string());
+                }
+                tile.brand = device.brand.clone();
+                tile.display_brand = device.display_brand.clone().filter(|b| !b.is_empty()).unwrap_or_else(|| device.brand.clone());
+                tile.status = TileStatus::Connected(DeviceReadout::from_status(&device.status, device.controls.clone(), device.tabs.clone().unwrap_or_default()));
+                v.after_status(&key, cx);
+                cx.notify();
+            });
+            if let Some(name) = new_name {
+                Self::load_art(&service, &key, &name, &view, cx).await;
+            }
+        })
+        .detach();
+    }
+
+    /// After a status read: the connect sound for a device that just appeared,
+    /// the low-battery alert, and the tray's battery.
+    fn after_status(&mut self, key: &str, cx: &mut Context<Self>) {
+        let Some(tile) = self.devices.tiles.iter().find(|t| t.key == key) else { return };
+        let TileStatus::Connected(readout) = &tile.status else { return };
+        let name = tile.name.clone();
+        let battery = readout.battery.map(|b| b.clamp(0.0, 100.0).round() as u8);
+        let charging = readout.charging;
+        if self.monitor.announce.remove(key) {
+            self.announce(format!("{name} connected"), false, true, cx);
+        }
+        if let Some(percent) = battery {
+            let due = self
+                .monitor
+                .low_alerted
+                .get(key)
+                .is_none_or(|at| at.elapsed() >= LOW_BATTERY_COOLDOWN);
+            if !charging && percent <= LOW_BATTERY_PERCENT && due {
+                self.monitor.low_alerted.insert(key.to_string(), std::time::Instant::now());
+                self.announce(format!("{name} battery is low · {percent}%"), true, true, cx);
+            }
+        }
+        self.update_tray();
+    }
+
+    /// The tray shows the open device's battery, else the first connected
+    /// device that reports one, else the app icon.
+    fn update_tray(&self) {
+        let reports = |t: &&Tile| matches!(&t.status, TileStatus::Connected(r) if r.battery.is_some());
+        let tile = self
+            .devices
+            .open
+            .as_ref()
+            .and_then(|key| self.devices.tiles.iter().find(|t| &t.key == key))
+            .filter(reports)
+            .or_else(|| self.devices.tiles.iter().find(reports));
+        let battery = tile.and_then(|t| match &t.status {
+            TileStatus::Connected(r) => r.battery.map(|b| crate::tray_battery::TrayBattery {
+                device_name: t.name.clone(),
+                percent: b.clamp(0.0, 100.0).round() as u8,
+                charging: r.charging,
+                style: crate::tray_battery::TrayBatteryStyle::Percentage,
+            }),
+            _ => None,
+        });
+        crate::tray::show_battery(battery.as_ref(), LOW_BATTERY_PERCENT);
     }
 
     /// Opens a device's settings page, connecting it first if needed.
@@ -1364,6 +1551,7 @@ impl AppView {
                 }
                 if connected_now {
                     v.sync_running_profiles(cx);
+                    v.after_status(&key, cx);
                 }
                 v.refresh_presence(cx);
                 cx.notify();

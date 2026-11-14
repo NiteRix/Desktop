@@ -13,6 +13,46 @@ mod imp {
     use tray_icon::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
     use crate::activity::ACTIVITY;
+    use crate::tray_battery::{self, TrayBattery};
+    use std::cell::RefCell;
+
+    thread_local! {
+        /// The tray icon, owned by the main thread for the life of the app.
+        static TRAY: RefCell<Option<tray_icon::TrayIcon>> = const { RefCell::new(None) };
+        /// What the icon shows now, so an unchanged reading is not redrawn.
+        static SHOWN: RefCell<Option<(TrayBattery, u8)>> = const { RefCell::new(None) };
+    }
+
+    const APP_TOOLTIP: &str = "OpenMouse Desktop";
+
+    /// Shows `battery` in the tray (Bridge's battery icon and tooltip), or the
+    /// app icon again when there is none. `threshold` is the low-battery level
+    /// that turns the icon red.
+    pub fn show_battery(battery: Option<&TrayBattery>, threshold: u8) {
+        let next = battery.map(|b| (b.clone(), threshold));
+        let unchanged = SHOWN.with(|shown| *shown.borrow() == next);
+        if unchanged {
+            return;
+        }
+        TRAY.with(|tray| {
+            let tray = tray.borrow();
+            let Some(tray) = tray.as_ref() else { return };
+            match battery {
+                Some(battery) => {
+                    let ink = battery.ink(threshold);
+                    let Ok((rgba, width, height)) = tray_battery::icon_rgba(battery, ink) else { return };
+                    let Ok(icon) = tray_icon::Icon::from_rgba(rgba, width, height) else { return };
+                    let _ = tray.set_icon(Some(icon));
+                    let _ = tray.set_tooltip(Some(tray_battery::tooltip(battery)));
+                }
+                None => {
+                    let _ = tray.set_icon(platform::icon());
+                    let _ = tray.set_tooltip(Some(APP_TOOLTIP));
+                }
+            }
+            SHOWN.with(|shown| *shown.borrow_mut() = next);
+        });
+    }
 
     enum Command {
         Show,
@@ -123,7 +163,7 @@ mod imp {
         }
         let Ok(tray) = TrayIconBuilder::new()
             .with_icon(icon)
-            .with_tooltip("OpenMouse Desktop")
+            .with_tooltip(APP_TOOLTIP)
             .with_menu(Box::new(menu))
             .with_menu_on_left_click(false)
             .build()
@@ -154,9 +194,9 @@ mod imp {
             }
         }));
 
-        // Owns the icon, so it lives as long as the app does.
+        // The main thread owns the icon for the life of the app.
+        TRAY.with(|slot| *slot.borrow_mut() = Some(tray));
         cx.spawn(async move |cx| {
-            let _tray = tray;
             while let Some(command) = queue.next().await {
                 match command {
                     Command::Show => {
@@ -181,7 +221,10 @@ mod imp {
 }
 
 #[cfg(any(windows, target_os = "macos"))]
-pub use imp::{hide, install};
+pub use imp::{hide, install, show_battery};
+
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn show_battery(_battery: Option<&crate::tray_battery::TrayBattery>, _threshold: u8) {}
 
 #[cfg(not(any(windows, target_os = "macos")))]
 pub fn install(_cx: &mut gpui_kit::App, _window: gpui_kit::AnyWindowHandle) -> bool {

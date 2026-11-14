@@ -38,6 +38,8 @@ gpui-pre-apple = { path = "vendor/gpui-pre-apple" }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
+# The tray's battery glyph is drawn with GDI (ported from OpenMouse Bridge).
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"] }
 tray-icon = { version = "0.24", default-features = false }
 raw-window-handle = "0.6"
 

@@ -11,6 +11,7 @@ pub mod overlay;
 pub mod presence_text;
 pub mod proc;
 pub mod tray;
+pub mod tray_battery;
 pub mod profiles;
 pub mod settings;
 pub mod supported_devices;

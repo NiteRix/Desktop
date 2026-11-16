@@ -20,6 +20,21 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.1",
+    date: "2026-11-16",
+    changes: [
+      "New: Attack Shark X8 SE and R1 support, by cable and on their receivers, with battery, DPI stages and polling rate",
+      "New: the web app's look, its twelve themes, and Bridge's tray battery, banner and chime",
+      "New: choose how many DPI stages the mouse cycles, give each stage its own light colour, and type stage values",
+      "New: switch DPI stage from the tray menu",
+      "New: battery history for the past week with an estimate of the time left",
+      "New: updates download in the background and install on restart",
+      "New: Copy diagnostics, to send a mouse's details when something isn't right",
+      "Improved: DPI changes show at once, including ones made with the mouse's own button",
+      "Fixed: squeezed, vertical text when the window is narrow",
+    ],
+  },
+  {
     version: "0.0.1",
     date: "2026-10-20",
     changes: [

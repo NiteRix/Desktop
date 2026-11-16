@@ -860,6 +860,8 @@ export async function writeControl(info: HidInterfaceInfo, status: any, id: stri
     case "perf.performanceMode": return w.setPerformanceMode(info, Boolean(value));
     case "perf.dpiStage": return w.setActiveDpiStage(info, Number(value));
     case "perf.dpiStageValue": { const { stage, dpi } = value as { stage: number; dpi: number }; return w.setDpiStageValue(info, Number(stage), Number(dpi)); }
+    case "perf.dpiStageCount": return callClientMethod(info, "setDpiStageCount", Math.round(Number(value)));
+    case "perf.dpiStageColor": { const { stage, color } = value as { stage: number; color: string }; return callClientMethod(info, "setDpiStageColor", Number(stage), String(color)); }
     case "perf.debounce": return w.setDebounceTime(info, Number(value));
     case "perf.lowPower": return w.setLowPowerThreshold(info, Number(value));
     case "perf.usbSpeed": return w.setUsbSpeed(info, value);

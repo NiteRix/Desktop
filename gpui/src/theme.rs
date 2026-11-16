@@ -33,6 +33,8 @@ pub enum ThemeChoice {
     Light,
     /// Wallpaper-derived accent ramp over the dark shell.
     Dynamic,
+    /// One of the web app's interface themes ([`WEB_THEMES`], by index).
+    Web(u8),
 }
 
 impl ThemeChoice {
@@ -43,8 +45,98 @@ impl ThemeChoice {
             ThemeChoice::Oled => "OLED",
             ThemeChoice::Light => "Light",
             ThemeChoice::Dynamic => "Dynamic",
+            ThemeChoice::Web(i) => WEB_THEMES.get(i as usize).map_or("Emerald", |t| t.label),
         }
     }
+
+    /// The stored name (`settings.json`).
+    pub fn key(self) -> String {
+        match self {
+            ThemeChoice::System => "system".into(),
+            ThemeChoice::Dark => "dark".into(),
+            ThemeChoice::Oled => "oled".into(),
+            ThemeChoice::Light => "light".into(),
+            ThemeChoice::Dynamic => "dynamic".into(),
+            ThemeChoice::Web(i) => format!("web:{}", WEB_THEMES.get(i as usize).map_or("emerald", |t| t.id)),
+        }
+    }
+
+    pub fn from_key(key: &str) -> Self {
+        match key {
+            "system" => ThemeChoice::System,
+            "oled" => ThemeChoice::Oled,
+            "light" => ThemeChoice::Light,
+            "dynamic" => ThemeChoice::Dynamic,
+            _ => key
+                .strip_prefix("web:")
+                .and_then(|id| WEB_THEMES.iter().position(|t| t.id == id))
+                .map_or(ThemeChoice::Dark, |i| ThemeChoice::Web(i as u8)),
+        }
+    }
+}
+
+/// One web interface theme (`src/styles/tokens.css`, `[data-interface-theme]`).
+pub struct WebTheme {
+    pub id: &'static str,
+    pub label: &'static str,
+    /// `--ink-0` (sidebar), `--ink-1` (page).
+    pub ink0: u32,
+    pub ink1: u32,
+    /// `--text-1`, `--text-3`.
+    pub text1: u32,
+    pub text3: u32,
+    pub accent: u32,
+    pub on_accent: u32,
+    pub light: bool,
+}
+
+/// The web's twelve, in its picker's order, with its exact tokens.
+pub const WEB_THEMES: [WebTheme; 12] = [
+    WebTheme { id: "emerald", label: "Emerald", ink0: 0x08090a, ink1: 0x0c0d0f, text1: 0xeef0f2, text3: 0x7f858d, accent: 0x5dde89, on_accent: 0x07160e, light: false },
+    WebTheme { id: "matt", label: "Matt", ink0: 0x0a0908, ink1: 0x0f0d0c, text1: 0xf3efeb, text3: 0x8a827a, accent: 0xf5975c, on_accent: 0x1a0e06, light: false },
+    WebTheme { id: "violet", label: "Violet", ink0: 0x09080c, ink1: 0x0e0c13, text1: 0xefedf7, text3: 0x847f97, accent: 0xa78bfa, on_accent: 0x130b25, light: false },
+    WebTheme { id: "ice", label: "Ice", ink0: 0x07090b, ink1: 0x0a0e11, text1: 0xedf3f7, text3: 0x7a8692, accent: 0x67d8ff, on_accent: 0x06161d, light: false },
+    WebTheme { id: "ember", label: "Ember", ink0: 0x0b0807, ink1: 0x110c0a, text1: 0xf6efeb, text3: 0x8f8077, accent: 0xff9b62, on_accent: 0x211006, light: false },
+    WebTheme { id: "mono", label: "Mono", ink0: 0x09090a, ink1: 0x0d0d0e, text1: 0xf1f1f3, text3: 0x808087, accent: 0xf1f1f3, on_accent: 0x09090b, light: false },
+    WebTheme { id: "miku", label: "Miku", ink0: 0x061012, ink1: 0x0a1719, text1: 0xe7f7f6, text3: 0x739996, accent: 0x39c5bb, on_accent: 0x031413, light: false },
+    WebTheme { id: "catppuccin-mocha", label: "Catppuccin Mocha", ink0: 0x11111b, ink1: 0x1e1e2e, text1: 0xcdd6f4, text3: 0x9399b2, accent: 0xcba6f7, on_accent: 0x1e1e2e, light: false },
+    WebTheme { id: "catppuccin-macchiato", label: "Catppuccin Macchiato", ink0: 0x181926, ink1: 0x24273a, text1: 0xcad3f5, text3: 0x939ab7, accent: 0xc6a0f6, on_accent: 0x24273a, light: false },
+    WebTheme { id: "catppuccin-frappe", label: "Catppuccin Frappé", ink0: 0x232634, ink1: 0x303446, text1: 0xc6d0f5, text3: 0xa5adce, accent: 0xca9ee6, on_accent: 0x303446, light: false },
+    WebTheme { id: "nier-automata", label: "NieR:Automata", ink0: 0x282620, ink1: 0x2f2d26, text1: 0xdad6c0, text3: 0xa4a08c, accent: 0xd1cdb7, on_accent: 0x2f2d26, light: false },
+    WebTheme { id: "light", label: "Light", ink0: 0xfbfbf9, ink1: 0xf2f2ef, text1: 0x17181a, text3: 0x63676e, accent: 0xc4581f, on_accent: 0xffffff, light: true },
+];
+
+fn hex_hsla(hex: u32) -> Hsla {
+    rgb_to_hsla(((hex >> 16) as u8, (hex >> 8) as u8, hex as u8))
+}
+
+/// Mixes `top` over `base` at `amount` (an opaque stand-in for the web's
+/// translucent hairlines and fills).
+fn over(base: Hsla, top: Hsla, amount: f32) -> Hsla {
+    let (b, t): (gpui_kit::Rgba, gpui_kit::Rgba) = (base.into(), top.into());
+    gpui_kit::Rgba {
+        r: b.r + (t.r - b.r) * amount,
+        g: b.g + (t.g - b.g) * amount,
+        b: b.b + (t.b - b.b) * amount,
+        a: 1.0,
+    }
+    .into()
+}
+
+/// Paints a web interface theme with its own tokens. A picked accent still wins.
+fn paint_web(index: u8, picked: Option<(u8, u8, u8)>, cx: &mut App) {
+    let theme = &WEB_THEMES[(index as usize).min(WEB_THEMES.len() - 1)];
+    let (ink0, ink1, text1, text3) = (hex_hsla(theme.ink0), hex_hsla(theme.ink1), hex_hsla(theme.text1), hex_hsla(theme.text3));
+    let (accent, accent_ink) = match picked {
+        Some(rgb) => {
+            let accent = rgb_to_hsla(rgb);
+            (accent, readable_ink(accent))
+        }
+        None => (hex_hsla(theme.accent), hex_hsla(theme.on_accent)),
+    };
+    let border = over(ink1, text1, 0.11);
+    let muted = over(ink1, text1, 0.06);
+    paint_shared(ink1, ink0, border, muted, text3, text1, accent, accent_ink, cx);
 }
 
 /// Default accent `#5dde89` as HSL: the same green Dynamic falls back to.
@@ -481,6 +573,7 @@ pub fn apply_choice(
 
     let mode = match choice {
         ThemeChoice::Light => ThemeMode::Light,
+        ThemeChoice::Web(i) if WEB_THEMES.get(i as usize).is_some_and(|t| t.light) => ThemeMode::Light,
         _ => ThemeMode::Dark,
     };
     Theme::change(mode, window, cx);
@@ -493,6 +586,7 @@ pub fn apply_choice(
         ThemeChoice::Dark => paint_matt(false, MATT_ACCENT, vibrancy, picked, wallpaper_hex, cx),
         ThemeChoice::Oled => paint_oled(vibrancy, picked, cx),
         ThemeChoice::Light => paint_matt(true, MATT_LIGHT_ACCENT, vibrancy, picked, wallpaper_hex, cx),
+        ThemeChoice::Web(index) => paint_web(index, picked, cx),
         ThemeChoice::System => unreachable!(),
     }
     set_surface_opacity(opacity, cx);

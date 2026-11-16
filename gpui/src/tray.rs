@@ -9,7 +9,7 @@ mod imp {
     use futures::channel::mpsc;
     use futures::StreamExt as _;
     use gpui_kit::{AnyWindowHandle, App, AppContext as _, Window};
-    use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+    use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use tray_icon::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
     use crate::activity::ACTIVITY;
@@ -21,6 +21,54 @@ mod imp {
         static TRAY: RefCell<Option<tray_icon::TrayIcon>> = const { RefCell::new(None) };
         /// What the icon shows now, so an unchanged reading is not redrawn.
         static SHOWN: RefCell<Option<(TrayBattery, u8)>> = const { RefCell::new(None) };
+        /// The device section the menu shows now.
+        static MENU_SHOWN: RefCell<Option<Option<super::TrayMenu>>> = const { RefCell::new(None) };
+        /// Called with a stage picked from the menu.
+        static ON_STAGE: RefCell<Option<std::rc::Rc<dyn Fn(usize, &mut App)>>> = const { RefCell::new(None) };
+    }
+
+    /// What to run when a DPI stage is picked in the tray menu.
+    pub fn on_stage(handler: impl Fn(usize, &mut App) + 'static) {
+        ON_STAGE.with(|slot| *slot.borrow_mut() = Some(std::rc::Rc::new(handler)));
+    }
+
+    /// The menu: the mouse and its battery, its DPI stages (the active one
+    /// ticked), then Open and Quit.
+    fn build_menu(device: Option<&super::TrayMenu>) -> Option<Menu> {
+        let menu = Menu::new();
+        if let Some(device) = device {
+            menu.append(&MenuItem::with_id("device", &device.title, false, None)).ok()?;
+            if !device.stages.is_empty() {
+                menu.append(&PredefinedMenuItem::separator()).ok()?;
+                for (i, (label, active)) in device.stages.iter().enumerate() {
+                    menu.append(&CheckMenuItem::with_id(format!("stage:{i}"), label, true, *active, None)).ok()?;
+                }
+            }
+            menu.append(&PredefinedMenuItem::separator()).ok()?;
+        }
+        menu.append_items(&[
+            &MenuItem::with_id("open", "Open OpenMouse", true, None),
+            &PredefinedMenuItem::separator(),
+            &MenuItem::with_id("quit", "Quit", true, None),
+        ])
+        .ok()?;
+        Some(menu)
+    }
+
+    /// Rebuilds the menu's device section when it changed.
+    pub fn show_menu(device: Option<&super::TrayMenu>) {
+        let next = Some(device.cloned());
+        if MENU_SHOWN.with(|shown| *shown.borrow() == next) {
+            return;
+        }
+        TRAY.with(|tray| {
+            let tray = tray.borrow();
+            let Some(tray) = tray.as_ref() else { return };
+            if let Some(menu) = build_menu(device) {
+                tray.set_menu(Some(Box::new(menu)));
+                MENU_SHOWN.with(|shown| *shown.borrow_mut() = next);
+            }
+        });
     }
 
     const APP_TOOLTIP: &str = "OpenMouse Desktop";
@@ -57,6 +105,7 @@ mod imp {
     enum Command {
         Show,
         Quit,
+        Stage(usize),
     }
 
     #[cfg(windows)]
@@ -155,12 +204,9 @@ mod imp {
         let Some(icon) = platform::icon() else {
             return false;
         };
-        let open = MenuItem::with_id("open", "Open OpenMouse", true, None);
-        let quit = MenuItem::with_id("quit", "Quit", true, None);
-        let menu = Menu::new();
-        if menu.append_items(&[&open, &PredefinedMenuItem::separator(), &quit]).is_err() {
+        let Some(menu) = build_menu(None) else {
             return false;
-        }
+        };
         let Ok(tray) = TrayIconBuilder::new()
             .with_icon(icon)
             .with_tooltip(APP_TOOLTIP)
@@ -176,10 +222,14 @@ mod imp {
         let (commands, mut queue) = mpsc::unbounded();
         let menu_commands = commands.clone();
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-            let command = match event.id.as_ref() {
+            let id: &str = event.id.as_ref();
+            let command = match id {
                 "open" => Command::Show,
                 "quit" => Command::Quit,
-                _ => return,
+                _ => match id.strip_prefix("stage:").and_then(|n| n.parse().ok()) {
+                    Some(stage) => Command::Stage(stage),
+                    None => return,
+                },
             };
             let _ = menu_commands.unbounded_send(command);
         }));
@@ -205,6 +255,11 @@ mod imp {
                     Command::Quit => {
                         let _ = cx.update(|cx| cx.quit());
                     }
+                    Command::Stage(stage) => {
+                        if let Some(handler) = ON_STAGE.with(|slot| slot.borrow().clone()) {
+                            let _ = cx.update(|cx| handler(stage, cx));
+                        }
+                    }
                 }
             }
         })
@@ -220,8 +275,23 @@ mod imp {
     }
 }
 
+/// The tray menu's device section: a title line and the DPI stages.
+#[derive(Clone, PartialEq, Debug)]
+pub struct TrayMenu {
+    /// "Attack Shark X8 SE · 85%".
+    pub title: String,
+    /// "Stage 2 · 1,600 DPI" and whether it is the active one.
+    pub stages: Vec<(String, bool)>,
+}
+
 #[cfg(any(windows, target_os = "macos"))]
-pub use imp::{hide, install, show_battery};
+pub use imp::{hide, install, on_stage, show_battery, show_menu};
+
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn show_menu(_device: Option<&TrayMenu>) {}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn on_stage(_handler: impl Fn(usize, &mut gpui_kit::App) + 'static) {}
 
 #[cfg(not(any(windows, target_os = "macos")))]
 pub fn show_battery(_battery: Option<&crate::tray_battery::TrayBattery>, _threshold: u8) {}

@@ -4,7 +4,7 @@ use crate::theme::ThemeChoice;
 use gpui_kit::assets::IconName;
 use gpui_kit::base::slider::{SliderEvent, SliderState};
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::radio::{Radio, RadioGroup};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::Icon;
 use gpui_kit::component::slider::Slider;
@@ -299,6 +299,8 @@ struct Devices {
     /// Label of the write in flight (disables further edits meanwhile).
     writing: Option<String>,
     write_error: Option<String>,
+    /// The stage count to go back to when "Stages" follows "Single".
+    last_stage_count: usize,
     /// Bumped when a write starts and when it lands: a status read that began
     /// before either is older than the page and is dropped.
     write_seq: u64,
@@ -394,9 +396,6 @@ fn hex_color(hex: &str) -> Hsla {
 const MONITOR_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
 /// Status (battery) is re-read every this many monitor ticks (30 s).
 const STATUS_EVERY_TICKS: u32 = 15;
-/// Battery level that turns the tray red and raises the low-battery alert
-/// (Bridge's default threshold).
-const LOW_BATTERY_PERCENT: u8 = 20;
 /// One low-battery alert per mouse per this long (Bridge's default cooldown).
 const LOW_BATTERY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
 
@@ -409,6 +408,8 @@ struct Monitor {
     announce: std::collections::HashSet<String>,
     /// When each mouse last raised the low-battery alert.
     low_alerted: std::collections::HashMap<String, std::time::Instant>,
+    /// Mice that already raised "fully charged" this charge.
+    charged_alerted: std::collections::HashSet<String>,
     /// The device block under the pointer (its render lifts, as on the web).
     hovered: Option<String>,
     /// Battery readings of the past week, per mouse name, for the Overview chart.
@@ -463,10 +464,18 @@ struct DeviceReadout {
     /// The on-device DPI stages (`dpiStages[].dpi`) and the active one.
     stages: Vec<f64>,
     active_stage: Option<usize>,
+    /// How many stages (from the first) the DPI button cycles.
+    stage_count: Option<usize>,
+    /// The mouse lets that count be changed.
+    stage_count_editable: bool,
+    /// Each stage's DPI light, `#rrggbb` (empty when the mouse has none).
+    stage_colors: Vec<String>,
     dpi: Option<f64>,
     polling_hz: Option<f64>,
     connection: Option<String>,
     firmware: Vec<String>,
+    /// The driver's whole status, for "Copy diagnostics".
+    raw: serde_json::Value,
 }
 
 impl DeviceReadout {
@@ -509,6 +518,14 @@ impl DeviceReadout {
                 .map(|a| a.iter().filter_map(|x| x.get("dpi").and_then(|d| d.as_f64()).or_else(|| x.as_f64())).collect())
                 .unwrap_or_default(),
             active_stage: s.get("activeDpiStage").and_then(|v| v.as_u64()).map(|n| n as usize),
+            stage_count: s.get("dpiStageCount").and_then(|v| v.as_u64()).map(|n| n as usize),
+            stage_count_editable: s
+                .get("ui")
+                .and_then(|u| u.get("dpiStageEditor"))
+                .and_then(|e| e.get("countEditable"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            stage_colors: strings("dpiStageColors"),
             charging: s
                 .get("batteryState")
                 .and_then(|v| v.as_str())
@@ -521,6 +538,7 @@ impl DeviceReadout {
                 .and_then(|v| v.as_array())
                 .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
                 .unwrap_or_default(),
+            raw: s.clone(),
         }
     }
 }
@@ -570,6 +588,8 @@ pub struct AppView {
     /// What a slider shows while it is being dragged, before the write lands.
     slider_live: std::collections::HashMap<String, f64>,
     slider_seq: u64,
+    /// The typeable value box of each DPI stage (`<device>/stage/<n>`).
+    stage_inputs: std::collections::HashMap<String, Entity<InputState>>,
     _subscriptions: Vec<Subscription>,
     _game_watcher: Option<crate::game_watcher::GameWatcher>,
     /// Cached ASCII background rows, keyed by their grid dimensions.
@@ -582,15 +602,23 @@ pub struct AppView {
     monitor: Monitor,
 }
 
-/// Theme swatches in Settings, in display order. Narrows the web app's seven
-/// presets to the five in scope: System follow + Matt dark + OLED dark +
-/// Matt light + Dynamic. (Emerald/Violet/Ice/Mono + custom CSS stay web-only
-/// for now.)
-const THEME_CHOICES: [ThemeChoice; 5] = [
+/// Themes in Settings, in display order: follow the system, the web app's
+/// twelve interface themes, then the native-only OLED and Dynamic.
+const THEME_CHOICES: [ThemeChoice; 15] = [
     ThemeChoice::System,
-    ThemeChoice::Dark,
+    ThemeChoice::Web(0),
+    ThemeChoice::Web(1),
+    ThemeChoice::Web(2),
+    ThemeChoice::Web(3),
+    ThemeChoice::Web(4),
+    ThemeChoice::Web(5),
+    ThemeChoice::Web(6),
+    ThemeChoice::Web(7),
+    ThemeChoice::Web(8),
+    ThemeChoice::Web(9),
+    ThemeChoice::Web(10),
+    ThemeChoice::Web(11),
     ThemeChoice::Oled,
-    ThemeChoice::Light,
     ThemeChoice::Dynamic,
 ];
 
@@ -709,6 +737,7 @@ impl AppView {
             control_sliders: Default::default(),
             slider_live: Default::default(),
             slider_seq: 0,
+            stage_inputs: Default::default(),
             _subscriptions: vec![sub_opacity, sub_vibrancy, sub_activity],
             _game_watcher: Some(game_watcher),
             ascii_rows: Vec::new(),
@@ -724,6 +753,10 @@ impl AppView {
         }
         view.scan_devices(cx);
         view.start_monitor(cx);
+        let weak = cx.entity().downgrade();
+        crate::tray::on_stage(move |stage, cx| {
+            let _ = weak.update(cx, |v: &mut Self, cx| v.tray_stage(stage, cx));
+        });
         view
     }
 
@@ -741,6 +774,7 @@ impl Default for AppView {
             control_sliders: Default::default(),
             slider_live: Default::default(),
             slider_seq: 0,
+            stage_inputs: Default::default(),
             sidebar_collapsed: false,
             settings: Settings::default(),
             games: Vec::new(),
@@ -1145,21 +1179,29 @@ impl AppView {
                 .low_alerted
                 .get(key)
                 .is_none_or(|at| at.elapsed() >= LOW_BATTERY_COOLDOWN);
-            if !charging && percent <= LOW_BATTERY_PERCENT && due {
+            if !charging && percent <= self.settings.low_battery_percent && due {
                 self.monitor.low_alerted.insert(key.to_string(), std::time::Instant::now());
                 self.notify_banner("Mouse battery is low".into(), format!("{name} has {percent}% battery remaining"), cx);
             }
+        }
+        // Fully charged: once per charge, when a charging mouse reaches 100 %.
+        if charging && battery == Some(100) {
+            if self.monitor.charged_alerted.insert(name.clone()) {
+                self.notify_banner(format!("{name} is fully charged"), "100% battery · you can unplug it".into(), cx);
+            }
+        } else if !charging {
+            self.monitor.charged_alerted.remove(&name);
         }
         self.update_tray();
     }
 
     /// Bridge's banner and chime: a mouse connecting or running low.
     fn notify_banner(&mut self, title: String, detail: String, cx: &mut Context<Self>) {
-        if self.settings.overlay_enabled {
+        if self.settings.device_banner {
             let corner = self.settings.overlay_corner;
             self.overlay = crate::overlay::show_banner(cx, self.overlay.take(), title, Some(detail), corner);
         }
-        if self.settings.overlay_sound {
+        if self.settings.device_sound {
             crate::audio::play_notification();
         }
     }
@@ -1184,7 +1226,49 @@ impl AppView {
             }),
             _ => None,
         });
-        crate::tray::show_battery(battery.as_ref(), LOW_BATTERY_PERCENT);
+        crate::tray::show_battery(battery.as_ref(), self.settings.low_battery_percent);
+        let menu = tile.and_then(|t| match &t.status {
+            TileStatus::Connected(r) => {
+                let in_use = r.stage_count.unwrap_or(r.stages.len()).min(r.stages.len());
+                let title = match r.battery {
+                    Some(b) => format!("{} · {}%{}", t.name, b.clamp(0.0, 100.0).round() as u8, if r.charging { " (charging)" } else { "" }),
+                    None => t.name.clone(),
+                };
+                let stages = if in_use > 1 {
+                    r.stages
+                        .iter()
+                        .take(in_use)
+                        .enumerate()
+                        .map(|(i, dpi)| (format!("Stage {} · {} DPI", i + 1, crate::web_style::group(*dpi)), r.active_stage == Some(i)))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                Some(crate::tray::TrayMenu { title, stages })
+            }
+            _ => None,
+        });
+        crate::tray::show_menu(menu.as_ref());
+    }
+
+    /// The device the tray shows: the open one, else the first that reports a battery.
+    fn tray_device(&self) -> Option<String> {
+        let reports = |t: &&Tile| matches!(&t.status, TileStatus::Connected(r) if r.battery.is_some());
+        self.devices
+            .open
+            .as_ref()
+            .and_then(|key| self.devices.tiles.iter().find(|t| &t.key == key))
+            .filter(reports)
+            .or_else(|| self.devices.tiles.iter().find(reports))
+            .map(|t| t.key.clone())
+    }
+
+    /// A DPI stage picked from the tray menu.
+    fn tray_stage(&mut self, stage: usize, cx: &mut Context<Self>) {
+        let Some(key) = self.tray_device() else { return };
+        let Some(index) = self.devices.tiles.iter().position(|t| t.key == key) else { return };
+        self.devices.selected = index;
+        self.set_control("perf.dpiStage".into(), serde_json::json!(stage), cx);
     }
 
     /// Opens a device's settings page, connecting it first if needed.
@@ -1211,6 +1295,30 @@ impl AppView {
     /// one stage's value), instead of waiting for the next status read.
     fn patch_stage(&mut self, key: &str, id: &str, value: &serde_json::Value) {
         let Some(Tile { status: TileStatus::Connected(r), .. }) = self.devices.tiles.iter_mut().find(|t| t.key == key) else { return };
+        match id {
+            "perf.dpiStageCount" => {
+                if let Some(count) = value.as_u64().map(|n| (n as usize).clamp(1, r.stages.len().max(1))) {
+                    r.stage_count = Some(count);
+                    if r.active_stage.is_some_and(|a| a >= count) {
+                        r.active_stage = Some(count - 1);
+                        r.dpi = r.stages.get(count - 1).copied().or(r.dpi);
+                        r.dpi_y = r.dpi;
+                    }
+                }
+                return;
+            }
+            "perf.dpiStageColor" => {
+                let stage = value.get("stage").and_then(|s| s.as_u64()).map(|n| n as usize);
+                let color = value.get("color").and_then(|c| c.as_str());
+                if let (Some(stage), Some(color)) = (stage, color) {
+                    if let Some(slot) = r.stage_colors.get_mut(stage) {
+                        *slot = color.to_ascii_lowercase();
+                    }
+                }
+                return;
+            }
+            _ => {}
+        }
         let (stage, dpi) = match id {
             "perf.dpiStage" => (value.as_u64().map(|n| n as usize), None),
             "perf.dpiStageValue" => (
@@ -1369,6 +1477,16 @@ impl AppView {
     /// Writes one Buttons/Advanced control (always immediate, as in the Tauri
     /// app) and shows the value that was sent once the mouse accepts it.
     fn set_control(&mut self, id: String, value: serde_json::Value, cx: &mut Context<Self>) {
+        // A stage edit made while another write is in flight (typing, then
+        // dragging) waits its turn instead of being dropped.
+        if self.devices.writing.is_some() && id.starts_with("perf.dpiStage") {
+            cx.spawn(async move |view, cx| {
+                cx.background_executor().timer(Duration::from_millis(250)).await;
+                let _ = view.update(cx, |v: &mut Self, cx| v.set_control(id, value, cx));
+            })
+            .detach();
+            return;
+        }
         if self.devices.writing.is_some() || (id.starts_with("perf.") && self.blocked_by_profile(cx)) {
             return;
         }
@@ -1397,6 +1515,7 @@ impl AppView {
                         v.patch_stage(&key, &id, &value);
                         if id.starts_with("perf.") {
                             v.refresh_presence(cx);
+                            v.update_tray();
                         }
                         // A control that reshapes the page (a switch gaining analog settings) returns the new layout.
                         let new_tabs = applied.get("tabs").and_then(|t| serde_json::from_value::<crate::hid::Tabs>(t.clone()).ok());
@@ -1494,6 +1613,7 @@ impl AppView {
                             v.patch_dpi_y(&key, y);
                         }
                         v.refresh_presence(cx);
+                        v.update_tray();
                     }
                     Ok(Err(error)) => v.devices.write_error = Some(error),
                     Err(_) => v.devices.write_error = Some("device runtime stopped".into()),
@@ -2106,7 +2226,7 @@ impl AppView {
             self.settings.last_notified_update_version = Some(info.version.clone());
             self.settings.save();
         }
-        if is_new && info.asset().is_some() {
+        if is_new && info.asset().is_some() && self.settings.auto_update {
             self.download_update(info, should_toast, cx);
         } else if should_toast {
             self.show_toast(format!("OpenMouse Desktop v{} is available — see Updates.", info.version), false, cx);
@@ -2960,8 +3080,51 @@ impl AppView {
         // stage's value through `perf.dpiStageValue`.
         let (dpi_min, dpi_max, dpi_step) = r.controls.as_ref().map(|c| (c.dpi.min, c.dpi.max, c.dpi.step.max(1.0))).unwrap_or((50.0, 22000.0, 50.0));
         let stages = r.stages.clone();
-        for (stage, value) in stages.into_iter().enumerate() {
+        for (stage, value) in stages.iter().copied().enumerate() {
             let key = format!("{device}/stage/{stage}");
+            // Keep the box and the slider on the mouse's value unless they
+            // are being edited (the mouse's own button, or a re-read, moved it).
+            if !self.slider_live.contains_key(&key) {
+                if let Some(input) = self.stage_inputs.get(&key).cloned() {
+                    let text = format!("{}", value.round() as i64);
+                    let editing = input.read(cx).focus_handle(cx).is_focused(window);
+                    if !editing && input.read(cx).value().as_ref() != text {
+                        input.update(cx, |s, cx| s.set_value(text, window, cx));
+                    }
+                }
+                if let Some(slider) = self.control_sliders.get(&key).cloned() {
+                    let at = (value.clamp(dpi_min, dpi_max) - dpi_min) as f32;
+                    if (slider.read(cx).value().end() - at).abs() > 0.5 {
+                        slider.update(cx, |s, cx| s.set_value(at, window, cx));
+                    }
+                }
+            }
+            if !self.stage_inputs.contains_key(&key) {
+                let input = cx.new(|cx| {
+                    let mut state = InputState::new(window, cx)
+                        .default_value(format!("{}", value.round() as i64))
+                        .validate(|text, _| text.len() <= 5 && text.chars().all(|c| c.is_ascii_digit()));
+                    state.set_text_align(TextAlign::Right, cx);
+                    state
+                });
+                let commit_device = device.clone();
+                let sub = cx.subscribe_in(&input, window, move |this: &mut Self, state, event: &InputEvent, window, cx| {
+                    if !matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                        return;
+                    }
+                    let typed = state.read(cx).value().trim().parse::<f64>().ok();
+                    match typed {
+                        Some(dpi) => this.stage_edit(&commit_device, stage, dpi, false, window, cx),
+                        // Nothing usable typed: put the stage's value back.
+                        None => {
+                            this.slider_live.remove(&format!("{commit_device}/stage/{stage}"));
+                        }
+                    }
+                    cx.notify();
+                });
+                self._subscriptions.push(sub);
+                self.stage_inputs.insert(key.clone(), input);
+            }
             if self.control_sliders.contains_key(&key) {
                 continue;
             }
@@ -2973,9 +3136,12 @@ impl AppView {
                     .default_value((value.clamp(dpi_min, dpi_max) - dpi_min) as f32)
             });
             let live_key = key.clone();
-            let sub = cx.subscribe_in(&slider, window, move |this: &mut Self, _s, event, _w, cx| {
+            let sub = cx.subscribe_in(&slider, window, move |this: &mut Self, _s, event, window, cx| {
                 let SliderEvent::Change(v) = event else { return };
                 let dpi = ((v.end() as f64 + dpi_min) / dpi_step).round() * dpi_step;
+                if let Some(input) = this.stage_inputs.get(&live_key).cloned() {
+                    input.update(cx, |s, cx| s.set_value(format!("{}", dpi.round() as i64), window, cx));
+                }
                 this.slider_live.insert(live_key.clone(), dpi);
                 this.slider_seq += 1;
                 let seq = this.slider_seq;
@@ -3043,6 +3209,44 @@ impl AppView {
             self._subscriptions.push(sub);
             self.control_sliders.insert(key, slider);
         }
+    }
+
+    /// One DPI stage's new value, from its box, the arrow keys or the scroll
+    /// wheel: snapped to the mouse's step and range, shown on the box and
+    /// slider at once, and written (after a pause, when `debounce`, so a run
+    /// of key presses sends one command).
+    fn stage_edit(&mut self, device: &str, stage: usize, dpi: f64, debounce: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Tile { status: TileStatus::Connected(r), .. }) = self.devices.tiles.iter().find(|t| t.key == device) else { return };
+        let (min, max, step) = r.controls.as_ref().map(|c| (c.dpi.min, c.dpi.max, c.dpi.step.max(1.0))).unwrap_or((50.0, 22000.0, 50.0));
+        let current = r.stages.get(stage).copied();
+        let dpi = ((dpi.clamp(min, max) - min) / step).round() * step + min;
+        let key = format!("{device}/stage/{stage}");
+        if let Some(input) = self.stage_inputs.get(&key).cloned() {
+            input.update(cx, |s, cx| s.set_value(format!("{}", dpi.round() as i64), window, cx));
+        }
+        if let Some(slider) = self.control_sliders.get(&key).cloned() {
+            slider.update(cx, |s, cx| s.set_value((dpi - min) as f32, window, cx));
+        }
+        if current.is_some_and(|c| (c - dpi).abs() < 0.5) && !self.slider_live.contains_key(&key) {
+            return;
+        }
+        self.slider_live.insert(key, dpi);
+        self.slider_seq += 1;
+        let seq = self.slider_seq;
+        let value = serde_json::json!({ "stage": stage, "dpi": dpi });
+        if !debounce {
+            self.set_control("perf.dpiStageValue".into(), value, cx);
+            return;
+        }
+        cx.spawn(async move |view, cx| {
+            cx.background_executor().timer(Duration::from_millis(450)).await;
+            let _ = view.update(cx, |this: &mut Self, cx| {
+                if this.slider_seq == seq {
+                    this.set_control("perf.dpiStageValue".into(), value, cx);
+                }
+            });
+        })
+        .detach();
     }
 
     /// A slider for a Buttons/Advanced/Performance control: accent-filled track
@@ -4084,7 +4288,8 @@ impl AppView {
             Some(dpi) => figure(&t, group(dpi), "DPI", 30.).into_any_element(),
             None => dash(),
         };
-        let stage_meta = r.active_stage.filter(|_| r.stages.len() > 1).map(|a| format!("Stage {} of {}", a + 1, r.stages.len()));
+        let in_use = r.stage_count.unwrap_or(r.stages.len()).clamp(1, r.stages.len().max(1));
+        let stage_meta = r.active_stage.filter(|_| in_use > 1).map(|a| format!("Stage {} of {}", a + 1, in_use));
         let polling = match r.polling_hz {
             Some(hz) => figure(&t, group(hz), "Hz", 30.).into_any_element(),
             None => dash(),
@@ -4093,7 +4298,12 @@ impl AppView {
             Some(b) => figure(&t, format!("{}", b.round() as i64), "%", 30.).into_any_element(),
             None => dash(),
         };
-        let battery_meta = r.battery.map(|_| if r.charging { "Charging".to_string() } else { "Discharging".to_string() });
+        let left = self.monitor.battery_log.get(&tile.name).and_then(crate::battery_history::time_left);
+        let battery_meta = r.battery.map(|_| match (r.charging, left) {
+            (true, _) => "Charging".to_string(),
+            (false, Some(left)) => format!("Discharging · {}", crate::battery_history::describe_left(left)),
+            (false, None) => "Discharging".to_string(),
+        });
         let mut setup = panel(&t)
             .gap(px(0.))
             .p(px(0.))
@@ -4109,10 +4319,11 @@ impl AppView {
                     .child(column("Polling rate", polling, None, false))
                     .child(column("Battery", battery, battery_meta, false)),
             );
-        if r.stages.len() > 1 {
+        if in_use > 1 {
             let mut chips = h_flex().items_center().gap(px(6.)).flex_wrap();
-            for (i, dpi) in r.stages.iter().enumerate() {
+            for (i, dpi) in r.stages.iter().enumerate().take(in_use) {
                 let active = r.active_stage == Some(i);
+                let light = r.stage_colors.get(i).map(|hex| hex_color(hex));
                 chips = chips.child(
                     div()
                         .id(("overview-stage", i))
@@ -4130,7 +4341,9 @@ impl AppView {
                         .border_color(t.lit())
                         .text_color(if active { t.text1 } else { t.text2 })
                         .hover(|c| c.bg(t.surface(2)))
-                        .when(active, |c| c.child(div().size(px(6.)).rounded_full().bg(t.ok)))
+                        .when(active || light.is_some(), |c| {
+                            c.child(div().size(px(7.)).rounded_full().bg(light.unwrap_or(t.ok)).when(!active, |d| d.opacity(0.5)))
+                        })
                         .child(group(*dpi))
                         .on_click(cx.listener(move |this, _, _, cx| this.set_control("perf.dpiStage".into(), serde_json::json!(i), cx))),
                 );
@@ -4157,7 +4370,7 @@ impl AppView {
             let samples = crate::battery_history::sample(&log, bars);
             let last = samples.len().saturating_sub(1);
             for (i, percent) in samples.into_iter().enumerate() {
-                let tone = if percent <= LOW_BATTERY_PERCENT { t.bad } else { t.accent };
+                let tone = if percent <= self.settings.low_battery_percent { t.bad } else { t.accent };
                 chart = chart.child(
                     div()
                         .flex_1()
@@ -4227,39 +4440,189 @@ impl AppView {
             .into_any_element()
     }
 
-    /// Performance › Sensitivity in stages (`DpiStagesEditor`): one row per
-    /// stage with its number (click to make it active), value and slider.
+    /// Performance › Sensitivity in stages (`DpiStagesEditor`): Stages or
+    /// Single, how many stages are in use, then one row per stage with its tick
+    /// (in use), number (click to make it active), light colour, a value box you
+    /// can type into (arrow keys and the scroll wheel step it) and a slider.
     fn render_stage_editor(&self, tile: &Tile, r: &DeviceReadout, cx: &mut Context<Self>) -> AnyElement {
         use crate::web_style::{alpha, figure, group, icon_el, panel, panel_head, Lucide, Tokens, R_SM};
         let t = Tokens::read(cx);
+        let total = r.stages.len();
+        let count = r.stage_count.unwrap_or(total).clamp(1, total.max(1));
+        let editable = r.stage_count_editable;
         let current = r.active_stage.and_then(|a| r.stages.get(a).copied()).or(r.dpi).unwrap_or(0.0);
+        let step = r.controls.as_ref().map(|c| c.dpi.step.max(1.0)).unwrap_or(50.0);
+        let set_count = move |n: usize| serde_json::json!(n.clamp(1, total.max(1)));
+
+        // `.om-segment`: Stages | Single.
+        let segment = |id: &'static str, label: &'static str, on: bool| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .h(px(28.))
+                .px(px(12.))
+                .rounded(px(R_SM))
+                .text_size(px(12.5))
+                .font_weight(FontWeight::SEMIBOLD)
+                .whitespace_nowrap()
+                .cursor_pointer()
+                .text_color(if on { t.text1 } else { t.text2 })
+                .when(on, |k| k.bg(t.surface(4)).border_1().border_color(t.lit()))
+                .when(!on, |k| k.hover(|k| k.text_color(t.text1).bg(t.glint())))
+                .child(label)
+        };
+        let single = count == 1;
+        let last_multi = if self.devices.last_stage_count < 2 { total } else { self.devices.last_stage_count.min(total) };
+        let mode = h_flex()
+            .flex_none()
+            .p(px(3.))
+            .gap(px(3.))
+            .rounded(px(8.))
+            .bg(hsla(0., 0., 0., 0.26))
+            .border_1()
+            .border_color(t.line(1))
+            .child(segment("stage-mode-multi", "Stages", !single).on_click(cx.listener(move |this, _, _, cx| {
+                this.set_control("perf.dpiStageCount".into(), serde_json::json!(last_multi), cx)
+            })))
+            .child(segment("stage-mode-single", "Single", single).on_click(cx.listener(move |this, _, _, cx| {
+                if count > 1 {
+                    this.devices.last_stage_count = count;
+                }
+                this.set_control("perf.dpiStageCount".into(), serde_json::json!(1), cx)
+            })));
+        let stepper_key = |id: &'static str, glyph: &'static str, enabled: bool| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(26.))
+                .rounded(px(R_SM))
+                .text_size(px(15.))
+                .text_color(if enabled { t.text1 } else { t.text4 })
+                .bg(t.surface(2))
+                .border_1()
+                .border_color(t.lit())
+                .when(enabled, |k| k.cursor_pointer().hover(|k| k.bg(t.surface(3))))
+                .child(glyph)
+        };
+        let in_use = h_flex()
+            .items_center()
+            .gap(px(8.))
+            .text_size(px(13.))
+            .text_color(t.text2)
+            .child(div().whitespace_nowrap().child("Stages in use"))
+            .when(editable, |row| {
+                row.child(stepper_key("stages-fewer", "−", count > 1).on_click(cx.listener(move |this, _, _, cx| {
+                    if count > 1 {
+                        this.set_control("perf.dpiStageCount".into(), set_count(count - 1), cx)
+                    }
+                })))
+            })
+            .child(div().whitespace_nowrap().min_w(px(42.)).text_center().font_weight(FontWeight::SEMIBOLD).text_color(t.text1).child(format!("{count} / {total}")))
+            .when(editable, |row| {
+                row.child(stepper_key("stages-more", "+", count < total).on_click(cx.listener(move |this, _, _, cx| {
+                    if count < total {
+                        this.set_control("perf.dpiStageCount".into(), set_count(count + 1), cx)
+                    }
+                })))
+            });
+
         let mut rows = div().flex().flex_col().border_t_1().border_color(t.line(1));
         for (i, dpi) in r.stages.iter().enumerate() {
             let active = r.active_stage == Some(i);
+            let used = i < count;
             let key = format!("{}/stage/{i}", tile.key);
             let live = self.slider_live.get(&key).copied().unwrap_or(*dpi);
             let slider = self.control_sliders.get(&key).cloned();
+            let input = self.stage_inputs.get(&key).cloned();
+            let color = r.stage_colors.get(i).cloned();
+            let picking = self.devices.expanded.as_deref() == Some(format!("stage-color-{i}").as_str());
+            let device = tile.key.clone();
+            let device_keys = device.clone();
+            let value_box = div()
+                .id(("stage-value", i))
+                .flex()
+                .items_center()
+                .flex_none()
+                .w(px(104.))
+                .h(px(36.))
+                .px(px(10.))
+                .rounded(px(R_SM))
+                .bg(hsla(0., 0., 0., 0.26))
+                .border_1()
+                .border_color(t.line(1))
+                .text_size(px(14.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(t.text1)
+                .map(|b| match input {
+                    Some(input) => b.child(Input::new(&input).appearance(false).w_full()),
+                    None => b.justify_end().child(format!("{}", live.round() as i64)),
+                })
+                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                    let delta = match event.keystroke.key.as_str() {
+                        "up" => step,
+                        "down" => -step,
+                        _ => return,
+                    };
+                    cx.stop_propagation();
+                    this.stage_edit(&device_keys, i, live + delta, true, window, cx);
+                }))
+                .on_scroll_wheel(cx.listener(move |this, event: &ScrollWheelEvent, window, cx| {
+                    let dy = event.delta.pixel_delta(px(20.)).y;
+                    if dy == px(0.) {
+                        return;
+                    }
+                    cx.stop_propagation();
+                    let now = this.slider_live.get(&format!("{device}/stage/{i}")).copied().unwrap_or(live);
+                    this.stage_edit(&device, i, now + if dy > px(0.) { step } else { -step }, true, window, cx);
+                }));
+            let tick = div()
+                .id(("stage-used", i))
+                .flex()
+                .items_center()
+                .justify_center()
+                .flex_none()
+                .size(px(20.))
+                .rounded(px(4.))
+                .border_1()
+                .when(used, |c| c.bg(t.accent).border_color(t.accent).child(icon_el(Lucide::Check, t.on_accent, 13.)))
+                .when(!used, |c| c.border_color(t.line(3)))
+                .when(editable, |c| {
+                    c.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
+                        // Unticking a stage stops the cycle before it; ticking
+                        // one extends the cycle to it.
+                        let next = if used { i.max(1) } else { i + 1 };
+                        this.set_control("perf.dpiStageCount".into(), serde_json::json!(next), cx)
+                    }))
+                });
+            let swatch = color.as_ref().map(|hex| {
+                div()
+                    .id(("stage-color", i))
+                    .flex_none()
+                    .size(px(18.))
+                    .rounded_full()
+                    .bg(hex_color(hex))
+                    .border_2()
+                    .border_color(if picking { t.text1 } else { t.line(3) })
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let id = format!("stage-color-{i}");
+                        this.devices.expanded = if this.devices.expanded.as_deref() == Some(id.as_str()) { None } else { Some(id) };
+                        cx.notify();
+                    }))
+            });
             rows = rows.child(
                 h_flex()
                     .items_center()
-                    .gap(px(14.))
+                    .gap(px(12.))
                     .h(px(55.))
                     .px(px(4.))
                     .border_b_1()
                     .border_color(t.line(1))
                     .when(active, |row| row.bg(alpha(t.accent, 0.07)))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .flex_none()
-                            .size(px(20.))
-                            .rounded(px(4.))
-                            .border_1()
-                            .border_color(t.line(3))
-                            .child(icon_el(Lucide::Check, t.text2, 13.)),
-                    )
+                    .child(tick)
                     .child(
                         div()
                             .id(("stage-number", i))
@@ -4272,54 +4635,70 @@ impl AppView {
                             .cursor_pointer()
                             .text_size(px(13.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(if active { t.accent } else { t.text2 })
+                            .text_color(if active { t.accent } else if used { t.text2 } else { t.text4 })
                             .when(active, |n| n.bg(alpha(t.accent, 0.16)))
                             .when(!active, |n| n.hover(|n| n.bg(t.glint())))
                             .child(format!("{}", i + 1))
-                            .on_click(cx.listener(move |this, _, _, cx| this.set_control("perf.dpiStage".into(), serde_json::json!(i), cx))),
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if used {
+                                    this.set_control("perf.dpiStage".into(), serde_json::json!(i), cx)
+                                } else {
+                                    this.show_toast(format!("Stage {} isn't in use. Tick it first.", i + 1), false, cx);
+                                }
+                            })),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_end()
-                            .flex_none()
-                            .w(px(116.))
-                            .h(px(36.))
-                            .px(px(14.))
-                            .rounded(px(R_SM))
-                            .bg(hsla(0., 0., 0., 0.26))
-                            .border_1()
-                            .border_color(t.line(1))
-                            .text_size(px(14.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(t.text1)
-                            .child(format!("{}", live.round() as i64)),
-                    )
-                    .child(div().flex_1().min_w_0().children(slider.map(|s| Slider::new(&s).bg(t.accent).text_color(t.text1)))),
+                    .children(swatch)
+                    .child(value_box)
+                    .child(div().flex_1().min_w(px(60.)).when(!used, |d| d.opacity(0.45)).children(slider.map(|s| Slider::new(&s).bg(t.accent).text_color(t.text1)))),
             );
+            if picking {
+                let mut swatches = h_flex().flex_wrap().gap(px(8.)).px(px(60.)).py(px(10.)).border_b_1().border_color(t.line(1));
+                for hex in LIGHT_SWATCHES.iter().filter(|h| **h != "#000000") {
+                    let chosen = color.as_deref().is_some_and(|c| c.eq_ignore_ascii_case(hex));
+                    let hex_value = hex.to_string();
+                    swatches = swatches.child(
+                        div()
+                            .id(SharedString::from(format!("stage-{i}-swatch-{hex}")))
+                            .size(px(22.))
+                            .rounded_full()
+                            .bg(hex_color(hex))
+                            .border_2()
+                            .border_color(if chosen { t.text1 } else { t.line(2) })
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.devices.expanded = None;
+                                this.set_control("perf.dpiStageColor".into(), serde_json::json!({ "stage": i, "color": hex_value }), cx)
+                            })),
+                    );
+                }
+                rows = rows.child(swatches);
+            }
         }
-        let count = r.stages.len();
+        let note = if r.stage_colors.is_empty() {
+            "Type a value or drag its slider; arrow keys and the scroll wheel step it. Click a number to make that stage active."
+        } else {
+            "Type a value or drag its slider; arrow keys and the scroll wheel step it. Click a number to make that stage active, and a colour dot to change that stage's light."
+        };
         panel(&t)
             .child(
                 h_flex()
                     .items_center()
                     .justify_between()
+                    .gap(px(12.))
                     .child(panel_head(&t, Some(Lucide::Crosshair), "Sensitivity", None))
                     .child(figure(&t, group(current), "DPI", 30.)),
             )
             .child(
                 h_flex()
+                    .flex_wrap()
+                    .items_center()
                     .justify_between()
-                    .text_size(px(13.))
-                    .text_color(t.text2)
-                    .child("Stages in use")
-                    .child(format!("{count} / {count}")),
+                    .gap(px(10.))
+                    .when(editable, |row| row.child(mode))
+                    .child(in_use),
             )
             .child(rows)
-            .child(div().text_size(px(13.)).text_color(t.text3).child(format!(
-                "One row per DPI stage, {count} fixed. Drag a slider to change its value. Click a number to make it the active stage."
-            )))
+            .child(div().text_size(px(13.)).text_color(t.text3).child(note))
             .into_any_element()
     }
 
@@ -4407,6 +4786,43 @@ impl AppView {
                     this.devices.expanded = if this.devices.expanded.as_deref() == Some("diagnostics") { None } else { Some("diagnostics".into()) };
                     cx.notify();
                 })),
+        );
+        let report = format!(
+            "OpenMouse Desktop v{APP_VERSION} ({})\nDevice: {}\nIdentifier: {}\nDriver: {}\n\n{}",
+            std::env::consts::OS,
+            tile.name,
+            tile.key,
+            tile.brand,
+            serde_json::to_string_pretty(&r.raw).unwrap_or_default()
+        );
+        let copy = div()
+            .id("copy-diagnostics")
+            .flex()
+            .items_center()
+            .justify_center()
+            .h(px(34.))
+            .px(px(14.))
+            .rounded(px(crate::web_style::R_SM))
+            .cursor_pointer()
+            .bg(t.surface(2))
+            .border_1()
+            .border_color(t.lit())
+            .text_size(px(13.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(t.text1)
+            .hover(|b| b.bg(t.surface(3)))
+            .child("Copy diagnostics")
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(report.clone()));
+                this.show_toast("Diagnostics copied. Paste them into your message.", false, cx);
+            }));
+        col = col.child(
+            h_flex()
+                .items_center()
+                .justify_between()
+                .gap(px(12.))
+                .child(div().flex_1().min_w_0().text_size(px(13.)).text_color(t.text3).child("Something not working? Copy this mouse's details and send them along."))
+                .child(copy),
         );
         if open {
             diag = diag.child(
@@ -5220,29 +5636,202 @@ impl AppView {
         title: &'static str,
         description: &'static str,
     ) -> Div {
-        div()
-            .flex()
-            .flex_col()
-            .gap_4()
+        let t = crate::web_style::Tokens::read(cx);
+        crate::web_style::panel(&t)
+            .gap(px(14.))
+            .p(px(20.))
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_base()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(description),
-                    ),
+                    .gap(px(4.))
+                    .pb(px(4.))
+                    .child(div().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).text_color(t.text1).child(title))
+                    .child(div().text_size(px(12.5)).text_color(t.text3).child(description)),
             )
-            .child(div().h(px(1.)).w_full().bg(cx.theme().border))
+    }
+
+    /// The theme picker: a card per theme, each a small preview of its page,
+    /// sidebar and accent.
+    fn render_theme_grid(&self, cx: &mut Context<Self>) -> AnyElement {
+        use crate::theme::WEB_THEMES;
+        let t = crate::web_style::Tokens::read(cx);
+        let hex = |v: u32| -> Hsla { rgb(v).into() };
+        let mut grid = h_flex().flex_wrap().gap(px(10.));
+        for choice in THEME_CHOICES {
+            // (sidebar, page, text, accent) for the preview.
+            let (side, page, ink, accent) = match choice {
+                ThemeChoice::Web(i) => {
+                    let w = &WEB_THEMES[i as usize];
+                    (hex(w.ink0), hex(w.ink1), hex(w.text1), hex(w.accent))
+                }
+                ThemeChoice::Oled => (hex(0x000000), hex(0x000000), hex(0xf2f2f2), hex(0x5dde89)),
+                ThemeChoice::Dynamic => {
+                    let (r, g, b) = crate::theme::cached_dynamic_accent().unwrap_or((93, 222, 137));
+                    (hex(0x0d0d0f), hex(0x111114), hex(0xf2f2f2), rgb(u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b)).into())
+                }
+                _ => (hex(0x08090a), hex(0xf2f2ef), hex(0x17181a), hex(0x5dde89)),
+            };
+            let system = choice == ThemeChoice::System;
+            let on = self.settings.theme == choice || (choice == ThemeChoice::Web(0) && self.settings.theme == ThemeChoice::Dark);
+            let sub = match choice {
+                ThemeChoice::System => if cfg!(target_os = "windows") { "Follow Windows" } else { "Follow system" },
+                ThemeChoice::Oled => "True black",
+                ThemeChoice::Dynamic => "From wallpaper",
+                _ => "",
+            };
+            let preview = div()
+                .relative()
+                .flex()
+                .h(px(54.))
+                .w_full()
+                .rounded(px(7.))
+                .overflow_hidden()
+                .border_1()
+                .border_color(t.line(1))
+                .child(div().w(px(22.)).h_full().bg(side))
+                .child(
+                    div()
+                        .flex_1()
+                        .h_full()
+                        .bg(page)
+                        .flex()
+                        .flex_col()
+                        .gap(px(5.))
+                        .p(px(8.))
+                        .child(div().w(px(34.)).h(px(4.)).rounded_full().bg(Hsla { a: 0.9, ..ink }))
+                        .child(div().w(px(22.)).h(px(4.)).rounded_full().bg(Hsla { a: 0.4, ..ink }))
+                        .child(div().w(px(18.)).h(px(7.)).mt_auto().rounded(px(3.)).bg(accent)),
+                )
+                .when(system, |p| {
+                    // Half dark, half light.
+                    p.child(div().absolute().right(px(0.)).top(px(0.)).bottom(px(0.)).w(relative(0.5)).bg(hex(0xf2f2ef)))
+                });
+            grid = grid.child(
+                div()
+                    .id(SharedString::from(format!("theme-{}", choice.key())))
+                    .flex()
+                    .flex_col()
+                    .gap(px(7.))
+                    .w(px(132.))
+                    .p(px(7.))
+                    .rounded(px(10.))
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(if on { t.accent } else { t.lit() })
+                    .bg(if on { crate::web_style::alpha(t.accent, 0.10) } else { t.surface(1) })
+                    .when(!on, |c| c.hover(|c| c.bg(t.surface(2))))
+                    .child(preview)
+                    .child(
+                        div()
+                            .px(px(2.))
+                            .flex()
+                            .flex_col()
+                            .child(div().truncate().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(t.text1).child(choice.label()))
+                            .when(!sub.is_empty(), |c| c.child(div().truncate().text_size(px(11.)).text_color(t.text3).child(sub))),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| this.set_theme(choice, window, cx))),
+            );
+        }
+        grid.into_any_element()
+    }
+
+    /// Mouse alerts: Bridge's banner and chime, and the low-battery level.
+    fn render_alert_settings(&self, cx: &mut Context<Self>) -> Div {
+        let t = crate::web_style::Tokens::read(cx);
+        let mut levels = h_flex().gap_2().flex_wrap();
+        for level in [10u8, 15, 20, 25, 30] {
+            levels = levels.child(self.chip(
+                format!("low-battery-{level}"),
+                format!("{level}%"),
+                self.settings.low_battery_percent == level,
+                cx,
+                move |this, cx| {
+                    this.settings.low_battery_percent = level;
+                    this.settings.save();
+                    this.monitor.low_alerted.clear();
+                    this.update_tray();
+                    cx.notify();
+                },
+            ));
+        }
+        self.render_settings_section(cx, "Mouse alerts", "When a mouse connects, runs low or finishes charging.")
+            .child(self.render_switch_row(
+                "device-banner",
+                "Show a banner",
+                "A small notice in the corner of the screen, like OpenMouse Bridge's.",
+                self.settings.device_banner,
+                cx,
+            ))
+            .child(self.render_switch_row(
+                "device-sound",
+                "Play a sound",
+                "Bridge's two-note chime with each notice.",
+                self.settings.device_sound,
+                cx,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .py_1()
+                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).text_color(t.text1).child("Low battery warning"))
+                    .child(div().text_xs().text_color(t.text3).child("Warn at this level. The tray icon turns red too."))
+                    .child(levels),
+            )
+    }
+
+    /// Updates: automatic install, the version, and a check now.
+    fn render_update_settings(&self, cx: &mut Context<Self>) -> Div {
+        let t = crate::web_style::Tokens::read(cx);
+        let status = if let Some(ready) = &self.update_ready {
+            format!("Version {} is downloaded and installs when you restart.", ready.version)
+        } else if self.update_downloading {
+            "Downloading an update…".to_string()
+        } else if let Some(info) = &self.update_available {
+            format!("Version {} is available.", info.version)
+        } else {
+            "You're on the newest version.".to_string()
+        };
+        self.render_settings_section(cx, "Updates", "New versions download in the background and install when OpenMouse restarts.")
+            .child(self.render_switch_row(
+                "auto-update",
+                "Update automatically",
+                "Download new versions on their own and install them on the next start.",
+                self.settings.auto_update,
+                cx,
+            ))
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
+                    .py_1()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .min_w_0()
+                            .child(div().text_sm().font_weight(FontWeight::MEDIUM).text_color(t.text1).child(format!("OpenMouse Desktop v{APP_VERSION}")))
+                            .child(div().text_xs().text_color(t.text3).child(status)),
+                    )
+                    .child(if self.update_ready.is_some() {
+                        Button::new("settings-restart-update")
+                            .compact()
+                            .label("Restart to update")
+                            .on_click(cx.listener(|this, _, _, cx| this.restart_to_update(cx)))
+                            .into_any_element()
+                    } else {
+                        Button::new("settings-check-updates")
+                            .compact()
+                            .label(if self.checking_for_updates { "Checking…" } else { "Check now" })
+                            .disabled(self.checking_for_updates)
+                            .on_click(cx.listener(|this, _, _, cx| this.check_for_updates_now(cx)))
+                            .into_any_element()
+                    }),
+            )
     }
 
     /// Labeled switch row: title + description on the left, [`Switch`] on the
@@ -5318,6 +5907,20 @@ impl AppView {
                             } else if let Some(open) = this.overlay.take() {
                                 let _ = open.update(cx, |_, window, _| window.remove_window());
                             }
+                        } else if switch_id == "device-banner" {
+                            this.settings.device_banner = *enabled;
+                        } else if switch_id == "device-sound" {
+                            this.settings.device_sound = *enabled;
+                            if *enabled {
+                                crate::audio::play_notification();
+                            }
+                        } else if switch_id == "auto-update" {
+                            this.settings.auto_update = *enabled;
+                            if *enabled {
+                                if let Some(info) = this.update_available.clone() {
+                                    this.download_update(info, true, cx);
+                                }
+                            }
                         } else if switch_id == "instant-apply-switch" {
                             this.settings.instant_apply = *enabled;
                             // Nothing may stay staged once edits stop being staged.
@@ -5335,92 +5938,38 @@ impl AppView {
 
     /// Appearance controls retain their entities and immediate persistence.
     fn render_settings(&self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let selected = THEME_CHOICES
-            .iter()
-            .position(|choice| *choice == self.settings.theme);
+        let t = crate::web_style::Tokens::read(cx);
         let show_vibrancy = self.settings.theme == ThemeChoice::Dynamic;
         div()
+            .id("settings-page")
             .size_full()
             .overflow_y_scrollbar()
             .child(
                 div()
                     .w_full()
-                    .max_w(rems(48.))
-                    .p_6()
+                    .max_w(px(820.))
+                    .pt(px(28.))
+                    .px(px(32.))
+                    .pb(px(48.))
                     .flex()
                     .flex_col()
-                    .gap_6()
+                    .gap(px(16.))
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xl()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child("Settings"),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child("Appearance and app preferences"),
-                            ),
+                            .gap(px(6.))
+                            .pb(px(6.))
+                            .child(div().text_size(px(22.)).font_weight(FontWeight::SEMIBOLD).text_color(t.text1).child("Settings"))
+                            .child(div().text_size(px(13.)).text_color(t.text2).child("Appearance, alerts, updates and app preferences.")),
                     )
                     .child(
                         self.render_settings_section(
                             cx,
                             "Appearance",
-                            "Choose a theme and adjust the window backdrop.",
+                            "Pick a theme (the same set as the web app) and adjust the window backdrop.",
                         )
-                        .child(
-                            RadioGroup::horizontal("theme-choice")
-                                .children(THEME_CHOICES.into_iter().map(|choice| {
-                                    let description = match choice {
-                                        ThemeChoice::System => {
-                                            if cfg!(target_os = "macos") {
-                                                "Follow macOS"
-                                            } else if cfg!(target_os = "windows") {
-                                                "Follow Windows"
-                                            } else {
-                                                "Follow system"
-                                            }
-                                        }
-                                        ThemeChoice::Dark => "Warm, muted",
-                                        ThemeChoice::Oled => "True black",
-                                        ThemeChoice::Light => "Bright, clear",
-                                        ThemeChoice::Dynamic => "From wallpaper",
-                                    };
-                                    Radio::new(choice.label())
-                                        .label(choice.label())
-                                        .flex_1()
-                                        .min_w(rems(7.5))
-                                        .p_3()
-                                        .border_1()
-                                        .rounded(cx.theme().radius)
-                                        .border_color(if choice == self.settings.theme {
-                                            cx.theme().primary
-                                        } else {
-                                            cx.theme().border
-                                        })
-                                        .when(choice == self.settings.theme, |this| {
-                                            this.bg(Hsla { a: 0.12, ..cx.theme().primary })
-                                        })
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(description),
-                                        )
-                                }))
-                                .selected_index(selected)
-                                .on_click(cx.listener(|this, index: &usize, window, cx| {
-                                    if let Some(choice) = THEME_CHOICES.get(*index) {
-                                        this.set_theme(*choice, window, cx);
-                                    }
-                                })),
-                        )
+                        .child(self.render_theme_grid(cx))
                         .child(
                             div()
                                 .flex()
@@ -5509,6 +6058,8 @@ impl AppView {
                             ))
                         }),
                     )
+                    .child(self.render_alert_settings(cx))
+                    .child(self.render_update_settings(cx))
                     .child(
                         self.render_settings_section(
                             cx,

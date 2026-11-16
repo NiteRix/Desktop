@@ -98,3 +98,65 @@ pub fn ago(at: SystemTime) -> String {
         }
     }
 }
+
+/// Time left at the rate the battery has been falling since it last went up
+/// (a charge, or a fresh battery). None until it has dropped a few percent
+/// over at least an hour, so a single noisy reading gives no estimate.
+pub fn time_left(log: &Log) -> Option<Duration> {
+    let (last_at, last) = *log.last()?;
+    let mut start = log.len() - 1;
+    while start > 0 && log[start - 1].1 >= log[start].1 {
+        start -= 1;
+    }
+    let (first_at, first) = log[start];
+    let dropped = first.saturating_sub(last);
+    let span = last_at.duration_since(first_at).ok()?;
+    if dropped < 3 || span < Duration::from_secs(60 * 60) {
+        return None;
+    }
+    let per_second = f64::from(dropped) / span.as_secs_f64();
+    Some(Duration::from_secs_f64(f64::from(last) / per_second))
+}
+
+/// "about 5 h left", "about 2 days left".
+pub fn describe_left(left: Duration) -> String {
+    let hours = left.as_secs() / 3600;
+    match hours {
+        0 => "under an hour left".to_string(),
+        1..=47 => format!("about {hours} h left"),
+        _ => format!("about {} days left", (hours + 12) / 24),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(hours: u64, percent: u8) -> (SystemTime, u8) {
+        (UNIX_EPOCH + Duration::from_secs(1_000_000 + hours * 3600), percent)
+    }
+
+    #[test]
+    fn estimates_from_the_current_discharge_only() {
+        // Charged to 100 at hour 10, then 10 % in 10 hours: 90 % left is ~90 h.
+        let log = vec![at(0, 40), at(5, 30), at(10, 100), at(15, 95), at(20, 90)];
+        let left = time_left(&log).unwrap();
+        assert_eq!(left.as_secs() / 3600, 90);
+        assert_eq!(describe_left(left), "about 4 days left");
+    }
+
+    #[test]
+    fn no_estimate_from_too_little() {
+        assert!(time_left(&vec![at(0, 80), at(5, 79)]).is_none());
+        assert!(time_left(&vec![at(0, 80)]).is_none());
+    }
+
+    #[test]
+    fn samples_spread_over_the_log() {
+        let log: Log = (0..100).map(|i| at(i, (100 - i) as u8)).collect();
+        let picked = sample(&log, 10);
+        assert_eq!(picked.len(), 10);
+        assert_eq!(picked[0], 100);
+        assert_eq!(picked[9], 1);
+    }
+}

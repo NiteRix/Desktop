@@ -80,6 +80,22 @@ struct StoredSettings {
     /// two sides already match).
     #[serde(default)]
     link_left_right: Option<bool>,
+    /// Battery level that raises the low-battery alert and turns the tray red.
+    #[serde(default = "default_low_battery")]
+    low_battery_percent: u8,
+    /// Mouse connected / low battery / fully charged: the on-screen banner.
+    #[serde(default = "default_true")]
+    device_banner: bool,
+    /// The same events: Bridge's chime.
+    #[serde(default = "default_true")]
+    device_sound: bool,
+    /// Download and install updates on their own.
+    #[serde(default = "default_true")]
+    auto_update: bool,
+}
+
+fn default_low_battery() -> u8 {
+    20
 }
 
 fn default_true() -> bool {
@@ -118,6 +134,10 @@ impl Default for StoredSettings {
             dynamic_vibrancy: default_vibrancy(),
             last_notified_update_version: None,
             link_left_right: None,
+            low_battery_percent: default_low_battery(),
+            device_banner: true,
+            device_sound: true,
+            auto_update: true,
         }
     }
 }
@@ -147,6 +167,10 @@ pub struct Settings {
     pub dynamic_vibrancy: f32,
     pub last_notified_update_version: Option<String>,
     pub link_left_right: Option<bool>,
+    pub low_battery_percent: u8,
+    pub device_banner: bool,
+    pub device_sound: bool,
+    pub auto_update: bool,
 }
 
 impl Default for Settings {
@@ -156,23 +180,11 @@ impl Default for Settings {
 }
 
 fn theme_from_str(s: &str) -> ThemeChoice {
-    match s {
-        "system" => ThemeChoice::System,
-        "oled" => ThemeChoice::Oled,
-        "light" => ThemeChoice::Light,
-        "dynamic" => ThemeChoice::Dynamic,
-        _ => ThemeChoice::Dark,
-    }
+    ThemeChoice::from_key(s)
 }
 
-fn theme_to_str(choice: ThemeChoice) -> &'static str {
-    match choice {
-        ThemeChoice::System => "system",
-        ThemeChoice::Dark => "dark",
-        ThemeChoice::Oled => "oled",
-        ThemeChoice::Light => "light",
-        ThemeChoice::Dynamic => "dynamic",
-    }
+fn theme_to_str(choice: ThemeChoice) -> String {
+    choice.key()
 }
 
 fn settings_path() -> Option<PathBuf> {
@@ -203,6 +215,10 @@ impl Settings {
             dynamic_vibrancy: stored.dynamic_vibrancy.clamp(0.0, MAX_VIBRANCY),
             last_notified_update_version: stored.last_notified_update_version,
             link_left_right: stored.link_left_right,
+            low_battery_percent: stored.low_battery_percent.clamp(5, 50),
+            device_banner: stored.device_banner,
+            device_sound: stored.device_sound,
+            auto_update: stored.auto_update,
         }
     }
 
@@ -231,6 +247,10 @@ impl Settings {
             dynamic_vibrancy: self.dynamic_vibrancy,
             last_notified_update_version: self.last_notified_update_version.clone(),
             link_left_right: self.link_left_right,
+            low_battery_percent: self.low_battery_percent,
+            device_banner: self.device_banner,
+            device_sound: self.device_sound,
+            auto_update: self.auto_update,
         };
         if let Ok(text) = serde_json::to_string_pretty(&stored) {
             let _ = std::fs::write(path, text);

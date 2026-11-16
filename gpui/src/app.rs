@@ -213,6 +213,12 @@ const GRID_GAP: f32 = 16.0;
 const PAGE_PAD: f32 = 16.0;
 const SIDEBAR_W: f32 = 248.0;
 const SIDEBAR_COLLAPSED_W: f32 = 68.0;
+/// The device page's side padding and its render rail's width.
+const PAGE_PAD_X: f32 = 32.0;
+const RAIL_W: f32 = 280.0;
+/// Height of the title bar row that carries the sidebar head (two lines of
+/// brand text need more than the toolkit's default caption height).
+const TITLEBAR_H: f32 = 48.0;
 
 /// The community server, the same invite openmouse.app links to.
 const DISCORD_INVITE_URL: &str = "https://discord.gg/yxC9jzMdw6";
@@ -293,6 +299,9 @@ struct Devices {
     /// Label of the write in flight (disables further edits meanwhile).
     writing: Option<String>,
     write_error: Option<String>,
+    /// Bumped when a write starts and when it lands: a status read that began
+    /// before either is older than the page and is dropped.
+    write_seq: u64,
 }
 
 /// Pending, unwritten lighting edits (each `None` field is untouched).
@@ -402,7 +411,7 @@ struct Monitor {
     low_alerted: std::collections::HashMap<String, std::time::Instant>,
     /// The device block under the pointer (its render lifts, as on the web).
     hovered: Option<String>,
-    /// Battery readings this session, per device, for the Overview chart.
+    /// Battery readings of the past week, per mouse name, for the Overview chart.
     battery_log: std::collections::HashMap<String, Vec<(std::time::SystemTime, u8)>>,
 }
 
@@ -700,7 +709,7 @@ impl AppView {
             ascii_rows: Vec::new(),
             ascii_dims: (0, 0),
             theme_seq: 0,
-            monitor: Monitor::default(),
+            monitor: Monitor { battery_log: crate::battery_history::load(), ..Monitor::default() },
         };
         // The OS entry is the truth for launch-on-startup, not the saved flag.
         view.profiles = crate::profiles::Profiles::load();
@@ -984,6 +993,9 @@ impl AppView {
         // A receiver whose mouse is asleep or on its cable is asked more often,
         // so switching the mouse on is noticed within a few seconds.
         let receivers_due = self.monitor.ticks % 3 == 0;
+        // The open device is re-read every other tick, so a stage changed with
+        // the mouse's own DPI button shows within a few seconds.
+        let open_due = self.monitor.ticks % 2 == 0 && self.devices.writing.is_none() && self.page == Page::Overview;
         let service = self.hid_service();
         cx.spawn(async move |view, cx| {
             let Ok(Ok(candidates)) = service.list_candidates().await else {
@@ -1023,7 +1035,10 @@ impl AppView {
                     .filter(|t| match t.status {
                         TileStatus::Idle => true,
                         TileStatus::Connected(_) => {
-                            reread || v.monitor.announce.contains(&t.key) || (receivers_due && t.name.contains("receiver"))
+                            reread
+                                || v.monitor.announce.contains(&t.key)
+                                || (receivers_due && t.name.contains("receiver"))
+                                || (open_due && v.devices.open.as_deref() == Some(t.key.as_str()))
                         }
                         _ => false,
                     })
@@ -1050,10 +1065,15 @@ impl AppView {
     fn refresh_tile(&mut self, key: &str, cx: &mut Context<Self>) {
         let service = self.hid_service();
         let key = key.to_string();
+        let seq = self.devices.write_seq;
         cx.spawn(async move |view, cx| {
             let connected = service.connect(&key).await;
             let mut new_name = None;
             let _ = view.update(cx, |v: &mut Self, cx| {
+                // A write began or landed meanwhile: this read predates it.
+                if v.devices.write_seq != seq || v.devices.writing.is_some() {
+                    return;
+                }
                 let Some(tile) = v.devices.tiles.iter_mut().find(|t| t.key == key) else { return };
                 let Ok(Ok(device)) = connected else {
                     if matches!(tile.status, TileStatus::Idle) {
@@ -1107,14 +1127,9 @@ impl AppView {
             self.notify_banner(name.clone(), detail, cx);
         }
         if let Some(percent) = battery {
-            let log = self.monitor.battery_log.entry(key.to_string()).or_default();
-            let now = std::time::SystemTime::now();
-            let changed = log.last().is_none_or(|(at, p)| *p != percent || now.duration_since(*at).is_ok_and(|d| d.as_secs() >= 300));
-            if changed {
-                log.push((now, percent));
-                if log.len() > 288 {
-                    log.remove(0);
-                }
+            let log = self.monitor.battery_log.entry(name.clone()).or_default();
+            if crate::battery_history::record(log, percent) {
+                crate::battery_history::save(&self.monitor.battery_log);
             }
         }
         if let Some(percent) = battery {
@@ -1185,6 +1200,34 @@ impl AppView {
         cx.notify();
     }
 
+    /// Reflects a confirmed DPI stage write straight away (the active stage, or
+    /// one stage's value), instead of waiting for the next status read.
+    fn patch_stage(&mut self, key: &str, id: &str, value: &serde_json::Value) {
+        let Some(Tile { status: TileStatus::Connected(r), .. }) = self.devices.tiles.iter_mut().find(|t| t.key == key) else { return };
+        let (stage, dpi) = match id {
+            "perf.dpiStage" => (value.as_u64().map(|n| n as usize), None),
+            "perf.dpiStageValue" => (
+                value.get("stage").and_then(|s| s.as_u64()).map(|n| n as usize),
+                value.get("dpi").and_then(|d| d.as_f64()),
+            ),
+            _ => return,
+        };
+        let Some(stage) = stage.filter(|s| *s < r.stages.len()) else { return };
+        if let Some(dpi) = dpi {
+            r.stages[stage] = dpi;
+            let live_key = format!("{key}/stage/{stage}");
+            if self.slider_live.get(&live_key).is_some_and(|v| (*v - dpi).abs() < 0.5) {
+                self.slider_live.remove(&live_key);
+            }
+        } else {
+            r.active_stage = Some(stage);
+        }
+        if r.active_stage == Some(stage) {
+            r.dpi = Some(r.stages[stage]);
+            r.dpi_y = r.dpi;
+        }
+    }
+
     /// Records the Y sensitivity of a confirmed unlinked write.
     fn patch_dpi_y(&mut self, key: &str, y: f64) {
         if let Some(Tile { status: TileStatus::Connected(r), .. }) = self.devices.tiles.iter_mut().find(|t| t.key == key) {
@@ -1218,6 +1261,12 @@ impl AppView {
                 r.dpi = applied.as_f64().or(r.dpi);
                 // Linked writes put Y on X as well; an unlinked pair sets Y after this.
                 r.dpi_y = r.dpi;
+                // A stage mouse takes the new value as its active stage's.
+                if let (Some(active), Some(dpi)) = (r.active_stage, r.dpi) {
+                    if let Some(slot) = r.stages.get_mut(active) {
+                        *slot = dpi;
+                    }
+                }
             }
             "pollingRate" => r.polling_hz = applied.as_f64().or(r.polling_hz),
             "liftOff" => r.lod = applied.as_str().map(str::to_string).or_else(|| r.lod.take()),
@@ -1327,6 +1376,7 @@ impl AppView {
             }
         }
         self.devices.writing = Some(id.clone());
+        self.devices.write_seq += 1;
         self.devices.write_error = None;
         cx.notify();
         let service = self.hid_service();
@@ -1334,8 +1384,13 @@ impl AppView {
             let result = service.write(&key, &brand, &format!("control:{id}"), value.clone()).await;
             let _ = view.update(cx, |v: &mut Self, cx| {
                 v.devices.writing = None;
+                v.devices.write_seq += 1;
                 match result {
                     Ok(Ok(applied)) => {
+                        v.patch_stage(&key, &id, &value);
+                        if id.starts_with("perf.") {
+                            v.refresh_presence(cx);
+                        }
                         // A control that reshapes the page (a switch gaining analog settings) returns the new layout.
                         let new_tabs = applied.get("tabs").and_then(|t| serde_json::from_value::<crate::hid::Tabs>(t.clone()).ok());
                         if let Some(tile) = v.devices.tiles.iter_mut().find(|t| t.key == key) {
@@ -1416,6 +1471,7 @@ impl AppView {
         let (key, brand) = (tile.key.clone(), tile.brand.clone());
         let requested_y = value.get("y").and_then(|y| y.as_f64());
         self.devices.writing = Some(action.to_string());
+        self.devices.write_seq += 1;
         self.devices.write_error = None;
         cx.notify();
         let service = self.hid_service();
@@ -1423,6 +1479,7 @@ impl AppView {
             let result = service.write(&key, &brand, action, value).await;
             let _ = view.update(cx, |v: &mut Self, cx| {
                 v.devices.writing = None;
+                v.devices.write_seq += 1;
                 match result {
                     Ok(Ok(applied)) => {
                         v.patch_readout(&key, action, &applied);
@@ -1483,6 +1540,7 @@ impl AppView {
             jobs.push(("lighting", value));
         }
         self.devices.writing = Some("apply".into());
+        self.devices.write_seq += 1;
         self.devices.write_error = None;
         cx.notify();
         let service = self.hid_service();
@@ -1517,6 +1575,7 @@ impl AppView {
             }
             let _ = view.update(cx, |v: &mut Self, cx| {
                 v.devices.writing = None;
+                v.devices.write_seq += 1;
                 let s = &mut v.devices.staged;
                 if done.dpi.is_some() { s.dpi = None; }
                 if done.dpi_y.is_some() { s.dpi_y = None; }
@@ -2687,11 +2746,12 @@ impl AppView {
                         .flex()
                         .flex_col()
                         .min_w_0()
-                        .child(div().text_size(px(15.)).font_weight(FontWeight(650.)).text_color(t.text1).child("OpenMouse"))
+                        .child(div().text_size(px(15.)).line_height(px(18.)).font_weight(FontWeight(650.)).text_color(t.text1).child("OpenMouse"))
                         .child(
                             div()
                                 .truncate()
                                 .text_size(px(11.))
+                                .line_height(px(14.))
                                 .text_color(t.text3)
                                 .child(format!("{} · v{APP_VERSION}", release_stage(APP_VERSION).to_uppercase())),
                         ),
@@ -3437,6 +3497,10 @@ impl AppView {
         let muted = cx.theme().muted_foreground;
         let border = cx.theme().border;
         let busy = self.devices.writing.is_some();
+        let sidebar = if self.sidebar_collapsed { SIDEBAR_COLLAPSED_W } else { SIDEBAR_W };
+        let page_w = (view_width - sidebar - 2.0 * PAGE_PAD_X).max(240.0);
+        let stacked = page_w < RAIL_W + 16.0 + 600.0;
+        let content_w = if stacked { page_w } else { page_w - RAIL_W - 16.0 };
         let staged = &self.devices.staged;
         let instant = self.settings.instant_apply;
 
@@ -3485,7 +3549,7 @@ impl AppView {
         let section = |title: &str| crate::web_style::panel(&web).child(crate::web_style::panel_head(&web, None, title, None));
 
         let content: AnyElement = match &tile.status {
-            TileStatus::Connected(r) if self.devices.tab == DeviceTab::Overview => self.render_device_overview(tile, r, cx),
+            TileStatus::Connected(r) if self.devices.tab == DeviceTab::Overview => self.render_device_overview(tile, r, content_w, cx),
             TileStatus::Connected(r) if self.devices.tab == DeviceTab::Advanced => self.render_device_advanced(tile, r, cx),
             TileStatus::Connected(r) if self.devices.tab != DeviceTab::Performance => self.render_extra_tab(r, cx),
             TileStatus::Connected(r) => {
@@ -3699,7 +3763,9 @@ impl AppView {
         .filter_map(|(tab, glyph, shown)| shown.then_some((tab, glyph)))
         .collect();
         // `.om-tabs`: a 40px well (4px padding and gap, radius 10) of 32px keys.
-        let mut tab_bar = h_flex().p(px(4.)).gap(px(4.)).h(px(40.)).rounded(px(R_MD)).bg(hsla(0., 0., 0., 0.26)).border_1().border_color(t.line(1));
+        let mut tab_bar = h_flex().flex_none().p(px(4.)).gap(px(4.)).h(px(40.)).rounded(px(R_MD)).bg(hsla(0., 0., 0., 0.26)).border_1().border_color(t.line(1));
+        // Icons only when the labels would not fit on one line.
+        let labels = content_w >= tabs.len() as f32 * 132.0;
         for (tab, glyph) in tabs {
             let active = self.devices.tab == tab;
             tab_bar = tab_bar.child(
@@ -3717,8 +3783,10 @@ impl AppView {
                     .text_color(if active { t.text1 } else { t.text2 })
                     .when(active, |k| k.bg(t.surface(4)).border_1().border_color(t.lit()))
                     .when(!active, |k| k.hover(|k| k.text_color(t.text1).bg(t.glint())))
+                    .flex_none()
+                    .whitespace_nowrap()
                     .child(icon_el(glyph, if active { t.accent } else { t.text3 }, 15.))
-                    .child(tab.label())
+                    .when(labels || active, |k| k.child(tab.label()))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.devices.tab = tab;
                         if has_profiles && matches!(tab, DeviceTab::Profiles | DeviceTab::Buttons) && this.devices.onboard.is_none() {
@@ -3774,16 +3842,34 @@ impl AppView {
                 let wired = c == "Wired";
                 h_flex().items_center().gap(px(6.)).child(icon_el(if wired { Lucide::Plug } else { Lucide::Wifi }, t.text3, 14.)).child(c)
             }));
-        let rail = div()
-            .flex()
-            .flex_col()
-            .gap(px(10.))
-            .flex_none()
-            .w(px(280.))
-            .child(crumb)
-            .child(div().text_size(px(22.)).font_weight(FontWeight(650.)).text_color(t.text1).line_height(px(28.)).child(tile.name.clone()))
-            .child(status_row)
-            .child(div().pt(px(8.)).child(self.device_art(tile, 280., 1.15)));
+        let title = div()
+            .text_size(px(22.))
+            .font_weight(FontWeight(650.))
+            .text_color(t.text1)
+            .line_height(px(28.))
+            .truncate()
+            .child(tile.name.clone());
+        // Narrow windows: the rail becomes a header (render beside the name)
+        // above the tabs, instead of a column that squeezes the panels.
+        let rail = if stacked {
+            h_flex()
+                .items_center()
+                .gap(px(18.))
+                .w_full()
+                .child(self.device_art(tile, 120., 1.15))
+                .child(div().flex().flex_col().gap(px(8.)).flex_1().min_w_0().child(crumb).child(title).child(status_row))
+        } else {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .flex_none()
+                .w(px(RAIL_W))
+                .child(crumb)
+                .child(title)
+                .child(status_row)
+                .child(div().pt(px(8.)).child(self.device_art(tile, RAIL_W, 1.15)))
+        };
 
         let show_bar = !instant && !staged.is_empty();
         // `.om-pending`: the floating pending-changes bar.
@@ -3862,11 +3948,12 @@ impl AppView {
                     .size_full()
                     .overflow_y_scrollbar()
                     .child(
-                        h_flex()
-                            .items_start()
-                            .gap(px(16.))
+                        div()
+                            .flex()
+                            .when(stacked, |d| d.flex_col().gap(px(20.)))
+                            .when(!stacked, |d| d.flex_row().items_start().gap(px(16.)))
                             .pt(px(28.))
-                            .px(px(32.))
+                            .px(px(PAGE_PAD_X))
                             .pb(px(if show_bar { 96. } else { 40. }))
                             .child(rail)
                             .child(
@@ -3896,20 +3983,23 @@ impl AppView {
 
     /// Overview tab (`DeviceOverview` in the web app): current setup figures,
     /// the DPI stage chips, and battery over time.
-    fn render_device_overview(&self, tile: &Tile, r: &DeviceReadout, cx: &mut Context<Self>) -> AnyElement {
+    fn render_device_overview(&self, tile: &Tile, r: &DeviceReadout, content_w: f32, cx: &mut Context<Self>) -> AnyElement {
         use crate::web_style::{figure, group, panel, panel_head, Tokens, R_SM};
         let t = Tokens::read(cx);
+        // Below this the three figures go one under another, and the battery
+        // and device panels stack.
+        let narrow = content_w < 560.0;
         let column = |label: &str, value: AnyElement, meta: Option<String>, first: bool| {
             div()
                 .flex()
                 .flex_col()
                 .gap(px(6.))
-                .flex_1()
-                .min_w_0()
-                .when(!first, |c| c.pl(px(20.)).border_l_1().border_color(t.line(1)))
-                .child(div().text_size(px(12.)).text_color(t.text3).child(label.to_string()))
+                .when(!narrow, |c| c.flex_1().min_w(px(120.)))
+                .when(!first && !narrow, |c| c.pl(px(20.)).border_l_1().border_color(t.line(1)))
+                .when(!first && narrow, |c| c.pt(px(14.)).border_t_1().border_color(t.line(1)))
+                .child(div().whitespace_nowrap().text_size(px(12.)).text_color(t.text3).child(label.to_string()))
                 .child(value)
-                .children(meta.map(|m| div().text_size(px(12.)).text_color(t.text3).child(m)))
+                .children(meta.map(|m| div().whitespace_nowrap().text_size(px(12.)).text_color(t.text3).child(m)))
         };
         let dash = || div().text_size(px(30.)).text_color(t.text4).child("–").into_any_element();
         let sensitivity = match r.dpi.filter(|d| *d > 0.0) {
@@ -3931,8 +4021,10 @@ impl AppView {
             .p(px(0.))
             .child(div().p(px(16.)).child(panel_head(&t, None, "Current setup", Some("Read from the device"))))
             .child(
-                h_flex()
-                    .items_start()
+                div()
+                    .flex()
+                    .when(narrow, |d| d.flex_col().gap(px(14.)))
+                    .when(!narrow, |d| d.flex_row().items_start())
                     .px(px(16.))
                     .pb(px(18.))
                     .child(column("Sensitivity", sensitivity, stage_meta, true))
@@ -3966,34 +4058,42 @@ impl AppView {
                 );
             }
             setup = setup.child(
-                h_flex()
-                    .items_center()
-                    .gap(px(16.))
+                div()
+                    .flex()
+                    .when(narrow, |d| d.flex_col().items_start().gap(px(10.)))
+                    .when(!narrow, |d| d.flex_row().items_center().gap(px(16.)))
                     .px(px(16.))
                     .py(px(12.))
                     .border_t_1()
                     .border_color(t.line(1))
-                    .child(div().text_size(px(13.)).text_color(t.text2).child("DPI stages"))
-                    .child(chips),
+                    .child(div().flex_none().whitespace_nowrap().text_size(px(13.)).text_color(t.text2).child("DPI stages"))
+                    .child(chips.flex_1().min_w_0()),
             );
         }
 
-        // Battery over time: the readings this app has taken, as bars.
-        let log = self.monitor.battery_log.get(&tile.key).cloned().unwrap_or_default();
+        // Battery over time: the past week's readings, as bars.
+        let log = self.monitor.battery_log.get(&tile.name).cloned().unwrap_or_default();
+        let bars = ((content_w - 40.0) / 9.0).clamp(12.0, 96.0) as usize;
         let mut chart = h_flex().items_end().gap(px(2.)).h(px(130.)).w_full().border_b_1().border_color(t.line(1));
         if log.len() >= 2 {
-            for (_, percent) in log.iter().rev().take(96).rev() {
-                chart = chart.child(div().flex_1().max_w(px(10.)).h(relative(f32::from(*percent).max(2.0) / 100.0)).rounded_t(px(2.)).bg(crate::web_style::alpha(t.accent, 0.55)));
+            let samples = crate::battery_history::sample(&log, bars);
+            let last = samples.len().saturating_sub(1);
+            for (i, percent) in samples.into_iter().enumerate() {
+                let tone = if percent <= LOW_BATTERY_PERCENT { t.bad } else { t.accent };
+                chart = chart.child(
+                    div()
+                        .flex_1()
+                        .max_w(px(10.))
+                        .h(relative(f32::from(percent).max(2.0) / 100.0))
+                        .rounded_t(px(2.))
+                        .bg(crate::web_style::alpha(tone, if i == last { 0.95 } else { 0.55 })),
+                );
             }
         }
-        let since = log.first().and_then(|(at, _)| at.elapsed().ok()).map(|d| {
-            let minutes = d.as_secs() / 60;
-            if minutes < 60 { format!("{minutes} min ago") } else { format!("{} h ago", minutes / 60) }
-        });
+        let since = log.first().map(|(at, _)| crate::battery_history::ago(*at));
         let battery_panel = panel(&t)
-            .flex_1()
-            .min_w_0()
-            .child(panel_head(&t, None, "Battery over time", Some("Recorded while this app is open")))
+            .when(!narrow, |p| p.flex_1().min_w_0())
+            .child(panel_head(&t, None, "Battery over time", Some("Past 7 days")))
             .child(if log.len() >= 2 {
                 div().flex().flex_col().gap(px(8.)).child(chart).child(
                     h_flex()
@@ -4010,26 +4110,42 @@ impl AppView {
                     "This mouse does not report its battery over this connection."
                 }).into_any_element()
             });
-        let device_panel = panel(&t)
-            .flex_1()
-            .min_w_0()
-            .child(panel_head(&t, None, "Device", None))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(8.))
-                    .text_size(px(13.))
-                    .child(h_flex().justify_between().child(div().text_color(t.text3).child("Model")).child(div().text_color(t.text1).child(tile.name.clone())))
-                    .child(h_flex().justify_between().child(div().text_color(t.text3).child("Connection")).child(div().text_color(t.text1).child(r.connection.clone().unwrap_or_else(|| "–".into()))))
-                    .child(h_flex().justify_between().child(div().text_color(t.text3).child("Firmware")).child(div().text_color(t.text1).child(if r.firmware.is_empty() { "Not reported".to_string() } else { r.firmware.join(" · ") }))),
-            );
+        let fact = |label: &str, value: String| {
+            h_flex()
+                .justify_between()
+                .gap(px(12.))
+                .child(div().flex_none().whitespace_nowrap().text_color(t.text3).child(label.to_string()))
+                .child(div().min_w_0().truncate().text_color(t.text1).child(value))
+        };
+        let mut facts = div()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .text_size(px(13.))
+            .child(fact("Model", tile.name.clone()))
+            .child(fact("Connection", r.connection.clone().unwrap_or_else(|| "–".into())))
+            .child(fact("Polling rate", r.polling_hz.map(|hz| format!("{} Hz", group(hz))).unwrap_or_else(|| "–".into())));
+        if r.stages.len() > 1 {
+            facts = facts.child(fact("DPI stages", r.stages.len().to_string()));
+        }
+        if !r.firmware.is_empty() {
+            facts = facts.child(fact("Firmware", r.firmware.join(" · ")));
+        }
+        let device_panel = panel(&t).when(!narrow, |p| p.flex_1().min_w_0()).child(panel_head(&t, None, "Device", None)).child(facts);
         div()
             .flex()
             .flex_col()
             .gap(px(16.))
             .child(setup)
-            .child(h_flex().items_start().gap(px(16.)).child(battery_panel).child(device_panel))
+            .child(
+                div()
+                    .flex()
+                    .gap(px(16.))
+                    .when(narrow, |d| d.flex_col())
+                    .when(!narrow, |d| d.flex_row().items_start())
+                    .child(battery_panel)
+                    .child(device_panel),
+            )
             .into_any_element()
     }
 
@@ -5588,7 +5704,7 @@ impl Render for AppView {
                 .flex_col()
                 .size_full()
                 .text_color(cx.theme().foreground)
-                .child(TitleBar::new().bg(clear).border_b_0().child(self.render_titlebar(cx)))
+                .child(TitleBar::new().bg(clear).border_b_0().h(px(TITLEBAR_H)).child(self.render_titlebar(cx)))
                 .child(
                     div()
                         .flex()

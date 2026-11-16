@@ -233,6 +233,7 @@ pub fn panel(t: &Tokens) -> Div {
     div()
         .flex()
         .flex_col()
+        .overflow_hidden()
         .gap(px(14.))
         .p(px(16.))
         .rounded(px(R_MD))
@@ -259,8 +260,9 @@ pub fn panel_head(t: &Tokens, glyph: Option<Lucide>, title: &str, sub: Option<&s
                 .child(icon_el(glyph, t.accent, 17.)),
         );
     }
-    row.child(div().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).text_color(t.text1).child(title.to_string()))
-        .children(sub.map(|s| div().text_size(px(12.)).text_color(t.text3).child(s.to_string())))
+    row.min_w_0()
+        .child(div().flex_none().whitespace_nowrap().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).text_color(t.text1).child(title.to_string()))
+        .children(sub.map(|s| div().flex_1().min_w_0().truncate().text_size(px(12.)).text_color(t.text3).child(s.to_string())))
 }
 
 /// A big tabular figure with its unit after it (`30/600`, unit at 12).
@@ -268,8 +270,10 @@ pub fn figure(t: &Tokens, value: String, unit: &str, size: f32) -> Div {
     div()
         .flex()
         .flex_row()
+        .flex_none()
         .items_end()
         .gap(px(5.))
+        .whitespace_nowrap()
         .child(div().text_size(px(size)).line_height(px(size * 1.1)).font_weight(FontWeight::SEMIBOLD).text_color(t.text1).child(value))
         .child(div().pb(px(size * 0.12)).text_size(px(13.)).text_color(t.text3).child(unit.to_string()))
 }

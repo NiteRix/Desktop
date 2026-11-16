@@ -1,6 +1,7 @@
 pub mod activity;
 pub mod app;
 pub mod audio;
+pub mod battery_history;
 pub mod changelog;
 pub mod autostart;
 mod game_watcher;

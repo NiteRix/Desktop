@@ -18,11 +18,28 @@ concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+# Pushes to x8-se publish a release too (see the last step), which is what
+# the app's auto-update reads.
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      PUBLISH: ${{ github.event_name == 'push' && github.ref == 'refs/heads/x8-se' }}
+      VERSION: 0.1.${{ github.run_number }}
     steps:
       - uses: actions/checkout@v4
+
+      # Every published build gets its own version, so installed copies can
+      # tell they are behind. (Cargo.lock follows on its own.)
+      - name: Stamp version
+        if: env.PUBLISH == 'true'
+        shell: bash
+        run: |
+          sed -i "0,/^version = \".*\"/s//version = \"$VERSION\"/" gpui/Cargo.toml gpui/installer/Cargo.toml
+          grep -m1 '^version' gpui/Cargo.toml gpui/installer/Cargo.toml
 
       - uses: actions/setup-node@v4
         with:
@@ -72,3 +89,31 @@ jobs:
           name: openmouse-windows
           path: OpenMouseDesktopSetup.exe
           if-no-files-found: error
+
+      # A release per build: the installer under a fixed name, and latest.json
+      # (version, notes from the commit, installer URL and SHA-256) that the
+      # app checks. releases/latest always points at the newest.
+      - name: Publish release
+        if: env.PUBLISH == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir release
+          cp OpenMouseDesktopSetup.exe release/
+          git log -1 --format=%B | grep -v -e '^Co-Authored-By:' -e '^Claude-Session:' | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}' > release/notes.md
+          node -e '
+            const fs = require("fs"), crypto = require("crypto");
+            const exe = fs.readFileSync("release/OpenMouseDesktopSetup.exe");
+            const v = process.env.VERSION, repo = process.env.GITHUB_REPOSITORY;
+            const notes = fs.readFileSync("release/notes.md", "utf8").split("\n")[0];
+            fs.writeFileSync("release/latest.json", JSON.stringify({
+              version: v, notes, pub_date: new Date().toISOString(),
+              platforms: { "windows-x86_64": {
+                url: `https://github.com/${repo}/releases/download/v${v}/OpenMouseDesktopSetup.exe`,
+                sha256: crypto.createHash("sha256").update(exe).digest("hex"), size: exe.length } }
+            }, null, 2));
+          '
+          cat release/latest.json
+          gh release create "v$VERSION" release/OpenMouseDesktopSetup.exe release/latest.json \
+            --title "OpenMouse Desktop $VERSION" --notes-file release/notes.md --target "$GITHUB_SHA" --latest

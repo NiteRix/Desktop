@@ -550,6 +550,9 @@ pub struct AppView {
     updates_list: ListState,
     /// Newest version `update_check` has seen, if it's ahead of `APP_VERSION`.
     update_available: Option<crate::update_check::UpdateInfo>,
+    /// A newer version's installer, downloaded and verified.
+    update_ready: Option<crate::update_check::Pending>,
+    update_downloading: bool,
     checking_for_updates: bool,
     /// The on-screen game overlay while one is up.
     overlay: Option<AnyWindowHandle>,
@@ -693,6 +696,8 @@ impl AppView {
             toast_seq: 0,
             updates_list: ListState::new(crate::changelog::entries().len() + UPDATES_LEADING_ROWS, ListAlignment::Top, px(400.)),
             update_available: None,
+            update_ready: None,
+            update_downloading: false,
             checking_for_updates: false,
             overlay: None,
             presence_seq: 0,
@@ -751,6 +756,8 @@ impl Default for AppView {
             toast_seq: 0,
             updates_list: ListState::new(crate::changelog::entries().len() + UPDATES_LEADING_ROWS, ListAlignment::Top, px(400.)),
             update_available: None,
+            update_ready: None,
+            update_downloading: false,
             checking_for_updates: false,
             overlay: None,
             presence_seq: 0,
@@ -2098,9 +2105,53 @@ impl AppView {
         if should_toast {
             self.settings.last_notified_update_version = Some(info.version.clone());
             self.settings.save();
+        }
+        if is_new && info.asset().is_some() {
+            self.download_update(info, should_toast, cx);
+        } else if should_toast {
             self.show_toast(format!("OpenMouse Desktop v{} is available — see Updates.", info.version), false, cx);
         }
         cx.notify();
+    }
+
+    /// Fetches and verifies a newer version's installer in the background.
+    fn download_update(&mut self, info: crate::update_check::UpdateInfo, announce: bool, cx: &mut Context<Self>) {
+        if self.update_downloading || self.update_ready.as_ref().is_some_and(|p| p.version == info.version) {
+            return;
+        }
+        self.update_downloading = true;
+        cx.spawn(async move |view, cx| {
+            let result = cx.background_executor().spawn(async move { crate::update_check::download(&info) }).await;
+            let _ = view.update(cx, |v: &mut Self, cx| {
+                v.update_downloading = false;
+                match result {
+                    Ok(pending) => {
+                        if announce {
+                            v.show_toast(format!("Update v{} is ready. Restart OpenMouse to install it.", pending.version), false, cx);
+                        }
+                        v.update_ready = Some(pending);
+                    }
+                    Err(error) => {
+                        if announce {
+                            v.show_toast(format!("Couldn't download the update: {error}"), true, cx);
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// "Restart to update": hands over to the downloaded installer and quits.
+    fn restart_to_update(&mut self, cx: &mut Context<Self>) {
+        let Some(pending) = self.update_ready.clone() else { return };
+        // The installer runs it now; next launch must not run it again.
+        let _ = crate::update_check::take_pending("0");
+        match crate::update_check::launch_installer(&pending, false) {
+            Ok(()) => cx.quit(),
+            Err(error) => self.show_toast(format!("Couldn't start the update: {error}"), true, cx),
+        }
     }
 
     /// "Check for updates" button: runs a check right now (not waiting for
@@ -2179,6 +2230,8 @@ impl AppView {
         // The click handler lives on the card's button, built here once per render
         // of the page (cheap); the list rows are built lazily below.
         let mut check_button = Some(check_button);
+        let ready = self.update_ready.is_some();
+        let downloading = self.update_downloading;
         let mut update_banner = self.update_available.as_ref().map(|info| {
             let notes = info.notes.clone().unwrap_or_default();
             h_flex()
@@ -2205,25 +2258,19 @@ impl AppView {
                         )
                         .children((!notes.is_empty()).then(|| div().text_xs().text_color(colors.muted).child(notes))),
                 )
-                .child(
+                .child(if ready {
+                    Button::new("restart-to-update")
+                        .compact()
+                        .label("Restart to update")
+                        .on_click(cx.listener(|this, _, _, cx| this.restart_to_update(cx)))
+                        .into_any_element()
+                } else {
                     Button::new("view-release")
                         .compact()
-                        .label("View release")
-                        .on_click(cx.listener(|_, _, _, _| {
-                            // Opens the GitHub release page for a manual download —
-                            // this pass is check + notify only, no in-app download/install.
-                            let _ = crate::proc::quiet(
-                                std::process::Command::new("cmd")
-                                    .args(["/C", "start", ""])
-                                    .arg("https://github.com/OpenMouse-Project/Desktop/releases/latest")
-                                    .stdin(std::process::Stdio::null())
-                                    .stdout(std::process::Stdio::null())
-                                    .stderr(std::process::Stdio::null()),
-                            )
-                            .spawn();
-                        }))
-                        .into_any_element(),
-                )
+                        .label(if downloading { "Downloading…" } else { "View release" })
+                        .on_click(cx.listener(|_, _, _, cx| cx.open_url(crate::update_check::RELEASES_URL)))
+                        .into_any_element()
+                })
                 .into_any_element()
         });
 
@@ -2663,6 +2710,37 @@ impl AppView {
             .pt(px(10.))
             .border_t_1()
             .border_color(t.line(1))
+            .children(self.update_ready.as_ref().map(|pending| {
+                div()
+                    .id("footer-restart-update")
+                    .flex()
+                    .items_center()
+                    .gap(px(11.))
+                    .w_full()
+                    .min_h(px(36.))
+                    .py(px(4.))
+                    .px(px(10.))
+                    .mb(px(4.))
+                    .rounded(px(R_SM))
+                    .cursor_pointer()
+                    .bg(alpha(t.accent, 0.14))
+                    .border_1()
+                    .border_color(alpha(t.accent, 0.35))
+                    .hover(|row| row.bg(alpha(t.accent, 0.22)))
+                    .child(div().flex_none().size(px(8.)).rounded_full().bg(t.accent))
+                    .when(!collapsed, |row| {
+                        row.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_w_0()
+                                .child(div().truncate().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(t.text1).child("Restart to update"))
+                                .child(div().truncate().text_size(px(11.)).text_color(t.text3).child(format!("Version {} is ready", pending.version))),
+                        )
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| this.restart_to_update(cx)))
+            }))
             .child(
                 foot_item("footer-updates", icon_el(Lucide::Megaphone, if on_updates { t.accent } else { t.text3 }, 17.).into_any_element(), "What's new", None, false, on_updates)
                     .on_click(cx.listener(|this, _, _, cx| {

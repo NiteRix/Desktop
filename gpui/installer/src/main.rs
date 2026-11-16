@@ -387,6 +387,11 @@ impl Render for InstallerView {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(at) = args.iter().position(|a| a == openmouse_installer::UPDATE_ARG) {
+        let _ = openmouse_installer::update(&args[at + 1..]);
+        return;
+    }
     let uninstall = uninstall_mode();
     application().with_assets(assets::AllAssets).run(move |cx| {
         init(cx);

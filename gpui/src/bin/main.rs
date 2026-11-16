@@ -12,6 +12,13 @@ fn main() {
         openmouse_gpui::supported_devices::write(&path);
         return;
     }
+    // An update downloaded last time and not installed yet: install it now
+    // (the installer starts the app again when it is done).
+    if let Some(pending) = openmouse_gpui::update_check::take_pending(env!("CARGO_PKG_VERSION")) {
+        if openmouse_gpui::update_check::launch_installer(&pending, openmouse_gpui::autostart::launched_by_os()).is_ok() {
+            return;
+        }
+    }
     application().with_assets(assets::AllAssets).run(|cx| {
         init(cx);
 

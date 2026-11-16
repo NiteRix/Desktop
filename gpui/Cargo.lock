@@ -4482,8 +4482,10 @@ dependencies = [
  "rquickjs",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sysinfo 0.39.6",
  "tray-icon",
+ "windows-sys 0.61.2",
  "winreg 0.52.0",
  "winres",
 ]

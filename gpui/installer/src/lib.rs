@@ -10,6 +10,11 @@ pub mod shortcuts;
 /// other mode instead of needing a second embedded binary.
 pub const UNINSTALL_ARG: &str = "--uninstall";
 
+/// Passed by the app when it hands over to a downloaded update: install
+/// without a window, then start the app again. Arguments after it are given
+/// to the restarted app (`--autostart` keeps a login start in the tray).
+pub const UPDATE_ARG: &str = "--update";
+
 /// One step of the install, reported back to the UI as it runs.
 #[derive(Debug, Clone)]
 pub struct StepUpdate {
@@ -61,6 +66,44 @@ pub fn install(desktop_shortcut: bool, mut report: impl FnMut(StepUpdate)) -> Re
     // Registry last: if anything above failed, Add/Remove Programs never
     // learns about a half-written install.
     registry::write()
+}
+
+/// The silent update [`UPDATE_ARG`] asks for. The app quits right after
+/// starting this, so its .exe stays locked for a moment: the new one is
+/// written beside it and swapped in once the old process has let go. The
+/// app is started again either way, so a failed update leaves the old
+/// version running rather than nothing.
+pub fn update(relaunch_args: &[String]) -> Result<(), String> {
+    let exe = paths::app_exe_path();
+    let staged = exe.with_extension("new");
+    let result = (|| {
+        std::fs::create_dir_all(paths::install_dir()).map_err(|e| e.to_string())?;
+        std::fs::write(&staged, payload::APP_EXE).map_err(|e| e.to_string())?;
+        let mut last = String::new();
+        for _ in 0..60 {
+            match std::fs::rename(&staged, &exe) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    last = e.to_string();
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&staged);
+        Err(format!("the app did not close in time: {last}"))
+    })();
+    if result.is_ok() {
+        if let Ok(self_exe) = std::env::current_exe() {
+            let _ = std::fs::copy(self_exe, paths::uninstaller_exe_path());
+        }
+        let _ = shortcuts::create_start_menu();
+        if paths::desktop_shortcut_path().is_some_and(|p| p.exists()) {
+            let _ = shortcuts::create_desktop();
+        }
+        let _ = registry::write();
+    }
+    let _ = std::process::Command::new(&exe).args(relaunch_args).spawn();
+    result
 }
 
 /// Removes everything `install` created except the install directory
